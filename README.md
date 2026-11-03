@@ -2,11 +2,16 @@
 [<img alt="crates.io" src="https://img.shields.io/crates/v/zipfs.svg?style=for-the-badge&logo=rust" height="20">](https://crates.io/crates/zipfs)
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-zipfs-66c2a5?style=for-the-badge&logo=docs.rs" height="20">](https://docs.rs/zipfs)
 
-An async filesystem on top of Zip files.
+Read zip archives held in memory, such as assets embedded with `include_bytes!`, without
+copying stored (uncompressed) files.
 
-This library is built on top of [Lunchbox](https://github.com/vivekpanyam/lunchbox), an async virtual filesystem interface.
-
-See the lunchbox docs for usage details.
+- `ZipArchive<D>` indexes an archive held in any `AsRef<[u8]>` (`&'static [u8]`, `Vec<u8>`,
+  `Arc<[u8]>`, a memory map). Stored files are returned borrowed, never copied; compressed files
+  are decompressed in pure Rust with size and CRC-32 checks.
+- `ZipSlice<'a>` is a view over `&'a [u8]` that allocates nothing: it walks the central
+  directory in place and borrows stored files for the lifetime of the bytes.
+- `ZipFS<D>` (feature `lunchbox`) is an async, read-only
+  [Lunchbox](https://github.com/vivekpanyam/lunchbox) filesystem over the same archive.
 
 # Getting started
 
@@ -14,34 +19,8 @@ Requires Rust 1.87 or newer.
 
 ```toml
 [dependencies]
-lunchbox = "0.1"
 zipfs = "0.0.2"
 ```
-
-## Step 1: Load a filesystem
-
-```rust
-use std::path::PathBuf;
-use zipfs::ZipFS;
-
-async fn load() -> std::io::Result<()> {
-    let zipfs = ZipFS::new(PathBuf::from("/some/path/to/a/file.zip")).await?;
-
-    // Use it like any other lunchbox filesystem. See the lunchbox docs for more details.
-    Ok(())
-}
-```
-
-# Synchronous, in-memory access
-
-For archives that are already in memory, such as assets embedded with `include_bytes!`, zipfs
-also has a synchronous API that needs no async runtime:
-
-- `ZipArchive<D>` indexes an archive held in any `AsRef<[u8]>` (`&'static [u8]`, `Vec<u8>`,
-  `Arc<[u8]>`, a memory map). Stored (uncompressed) files are returned borrowed, never copied;
-  compressed files are decompressed in pure Rust with size and CRC-32 checks.
-- `ZipSlice<'a>` is a view over `&'a [u8]` that allocates nothing: it walks the central
-  directory in place and borrows stored files for the lifetime of the bytes.
 
 ```rust
 use zipfs::{ZipArchive, ZipSlice};
@@ -66,16 +45,43 @@ Both follow symlinks in the final path component. Pack assets with already-compr
 (PNG, OGG, KTX2) stored, e.g. `zip -r -n .png:.ogg:.ktx2 assets.zip assets/`, to get them without
 copying.
 
-# Compression features
+## As a Lunchbox filesystem
 
-| Feature   | Default | Enables                                                  |
-|-----------|---------|----------------------------------------------------------|
-| `deflate` | yes     | Reading Deflate entries (what most zip tools produce)    |
-| `zstd`    | yes     | Reading Zstandard entries (builds the C `zstd` library)  |
+```toml
+[dependencies]
+lunchbox = "0.1"
+zipfs = { version = "0.0.2", features = ["lunchbox"] }
+```
 
-The `zstd` feature compiles C code. On `wasm32-wasip1` this needs a WASI C toolchain
-([wasi-sdk](https://github.com/WebAssembly/wasi-sdk)); without one, build with
-`default-features = false, features = ["deflate"]`.
+```rust
+use std::sync::Arc;
+
+use lunchbox::ReadableFileSystem;
+use zipfs::ZipFS;
+
+async fn load(assets: &'static [u8]) -> std::io::Result<()> {
+    // Embedded bytes, or any cheaply clonable buffer such as `Arc<[u8]>`.
+    let fs = ZipFS::new(assets)?;
+    let config = fs.read_to_string("config/game.json").await?;
+
+    // An archive file on disk, read into memory (needs a tokio runtime).
+    let fs: ZipFS<Arc<[u8]>> = ZipFS::from_file("assets.zip").await?;
+
+    // Use it like any other lunchbox filesystem. See the lunchbox docs for more details.
+    Ok(())
+}
+```
+
+# Features
+
+| Feature     | Default | Enables                                                              |
+|-------------|---------|----------------------------------------------------------------------|
+| `deflate`   | yes     | Reading Deflate entries (what most zip tools produce), via `miniz_oxide` |
+| `zstd`      | yes     | Reading Zstandard entries, via the pure-Rust `ruzstd`                |
+| `crc32fast` | yes     | Hardware-accelerated CRC-32 via `crc32fast`; otherwise a built-in implementation is used |
+| `lunchbox`  | no      | `ZipFS`, an async Lunchbox filesystem (adds `lunchbox`, `async-trait` and `tokio`) |
+
+Everything is pure Rust and builds for WebAssembly, including `wasm32-wasip1`.
 
 To use zip files as plain, uncompressed containers, disable the default features:
 
@@ -84,7 +90,7 @@ To use zip files as plain, uncompressed containers, disable the default features
 zipfs = { version = "0.0.2", default-features = false }
 ```
 
-Only Stored (uncompressed) entries can then be read, and no decompression code is compiled in.
-`ZipFS::new` returns an `std::io::ErrorKind::Unsupported` error for any archive that contains an
-entry using a compression method whose feature is disabled. Create compatible archives with
-`zip -0 -r assets.zip assets/`.
+Only stored (uncompressed) entries can then be read, no decompression code is compiled in, and
+zipfs has no dependencies. Opening an archive that contains an entry using a compression method
+whose feature is disabled fails with `std::io::ErrorKind::Unsupported`. Create compatible
+archives with `zip -0 -r assets.zip assets/`.
