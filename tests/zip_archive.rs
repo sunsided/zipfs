@@ -1115,6 +1115,40 @@ fn symlinks_are_followed_in_every_path_component() {
     );
 }
 
+/// Long targets that are expanded repeatedly must not make resolution do unbounded work: the
+/// walk stops after a fixed number of path components.
+#[cfg(feature = "full-symlinks")]
+#[test]
+fn path_resolution_work_is_bounded() {
+    let target = vec!["d"; 2047].join("/");
+    let target: &'static [u8] = target.into_bytes().leak();
+    let bytes = build(
+        &[Hand::symlink(b"big", target), Hand::file(b"x", b"x")],
+        b"",
+    );
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    let slice = ZipSlice::new(&bytes).unwrap();
+
+    let back = "../".repeat(2047);
+    let path = format!("big/{back}big/{back}big/x");
+    let started = std::time::Instant::now();
+    assert_eq!(zip.read(&path).unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        slice.get(&path).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "resolution took {:?}",
+        started.elapsed()
+    );
+
+    // One expansion stays within the bound and resolves normally.
+    let path = format!("big/{back}x");
+    assert_eq!(&*zip.read(&path).unwrap(), b"x");
+    assert_eq!(slice.get(&path).unwrap(), b"x");
+}
+
 #[cfg(not(feature = "full-symlinks"))]
 #[test]
 fn symlinks_are_followed_in_the_final_component_only() {

@@ -301,7 +301,9 @@ impl<'a> ZipSlice<'a> {
     /// Follows symlinks in every path component (`full-symlinks`).
     #[cfg(feature = "full-symlinks")]
     fn resolve_walk<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
-        let resolved = paths::resolve_walk(path, true, false, |p| self.symlink_target_bytes(p))?;
+        let symlinks = self.symlinks()?;
+        let resolved =
+            paths::resolve_walk(path, true, false, |p| self.symlink_target_in(&symlinks, p))?;
         let entry = match self.find(&resolved)? {
             Some(entry) => entry,
             None if self.has_children(&resolved)? => {
@@ -318,7 +320,10 @@ impl<'a> ZipSlice<'a> {
     /// Returns the target of the symlink at `path` as a normalized path from the archive root.
     pub fn read_link(&self, path: &str) -> io::Result<String> {
         #[cfg(feature = "full-symlinks")]
-        let link_path = paths::resolve_walk(path, false, false, |p| self.symlink_target_bytes(p))?;
+        let symlinks = self.symlinks()?;
+        #[cfg(feature = "full-symlinks")]
+        let link_path =
+            paths::resolve_walk(path, false, false, |p| self.symlink_target_in(&symlinks, p))?;
         #[cfg(not(feature = "full-symlinks"))]
         let link_path = normalize(path).ok_or_else(|| not_found(path))?;
         let entry = self
@@ -333,24 +338,51 @@ impl<'a> ZipSlice<'a> {
         {
             let target = paths::check_link_target(target)?.replace('\\', "/");
             let joined = format!("{}/{target}", paths::parent(&link_path));
-            paths::resolve_walk(&joined, false, true, |p| self.symlink_target_bytes(p))
+            paths::resolve_walk(&joined, false, true, |p| {
+                self.symlink_target_in(&symlinks, p)
+            })
         }
         #[cfg(not(feature = "full-symlinks"))]
         paths::resolve_link(&link_path, target)
     }
 
-    /// The raw target of the entry at a normalized path, if it is a symlink.
+    /// The symlinks of the archive by normalized path, as `find` would see them (the last
+    /// entry with a path wins, so a later non-symlink entry hides an earlier symlink).
+    ///
+    /// Collected once per resolution so that each path component checks this short list
+    /// instead of scanning the central directory again; empty, and allocation-free, for
+    /// archives without symlinks.
     #[cfg(feature = "full-symlinks")]
-    fn symlink_target_bytes(&self, normalized: &str) -> io::Result<Option<Vec<u8>>> {
-        match self.find(normalized)? {
-            Some(entry) if entry.kind() == EntryKind::Symlink => {
-                let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];
-                Ok(Some(
-                    self.link_target(normalized, &entry, &mut buffer)?.to_vec(),
-                ))
+    fn symlinks(&self) -> io::Result<Vec<(String, Entry<'a>)>> {
+        let mut symlinks: Vec<(String, Entry<'a>)> = Vec::new();
+        for entry in self.entries() {
+            let entry = entry?;
+            let Some(name) = paths::normalize_entry_name(&entry.name()?).map(Cow::into_owned)
+            else {
+                continue;
+            };
+            symlinks.retain(|(existing, _)| *existing != name);
+            if entry.kind() == EntryKind::Symlink && !name.is_empty() {
+                symlinks.push((name, entry));
             }
-            _ => Ok(None),
         }
+        Ok(symlinks)
+    }
+
+    /// Looks a normalized path up in [`symlinks`](Self::symlinks) and reads its target.
+    #[cfg(feature = "full-symlinks")]
+    fn symlink_target_in(
+        &self,
+        symlinks: &[(String, Entry<'a>)],
+        normalized: &str,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some((_, entry)) = symlinks.iter().find(|(name, _)| name == normalized) else {
+            return Ok(None);
+        };
+        let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];
+        Ok(Some(
+            self.link_target(normalized, entry, &mut buffer)?.to_vec(),
+        ))
     }
 
     /// Whether any entry lies below the normalized directory path `dir`, which makes `dir` a

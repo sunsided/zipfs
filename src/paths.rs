@@ -123,6 +123,12 @@ pub(crate) fn check_link_target(target: &[u8]) -> io::Result<&str> {
     Ok(target)
 }
 
+/// Upper bound on the path components one resolution may process, counting the components
+/// symlink targets add. Legitimate paths stay far below it; without it, a few long targets that
+/// refer to each other would make resolution do work quadratic in their length.
+#[cfg(feature = "full-symlinks")]
+const MAX_WALK_COMPONENTS: usize = 4096;
+
 /// Resolves `path` component by component, following a symlink wherever one occurs (the
 /// `full-symlinks` feature). The final component is followed only if `follow_final` is set.
 ///
@@ -133,7 +139,8 @@ pub(crate) fn check_link_target(target: &[u8]) -> io::Result<&str> {
 /// of the entry at a normalized path if that entry is a symlink.
 ///
 /// `from_link` marks paths built from a symlink target, for which climbing above the archive
-/// root is an invalid link rather than a missing file.
+/// root is an invalid link rather than a missing file. Work is bounded: at most
+/// [`MAX_SYMLINK_HOPS`] links and [`MAX_WALK_COMPONENTS`] components per call.
 #[cfg(feature = "full-symlinks")]
 pub(crate) fn resolve_walk(
     path: &str,
@@ -141,36 +148,69 @@ pub(crate) fn resolve_walk(
     from_link: bool,
     mut symlink_target: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>,
 ) -> io::Result<String> {
-    let mut pending: Vec<String> = path.split('/').rev().map(str::to_string).collect();
-    let mut resolved: Vec<String> = Vec::new();
+    /// Queues the components of `text` so that they pop in order, skipping empty and `.`
+    /// components, so an empty queue means the last real component has been reached.
+    fn queue(pending: &mut Vec<String>, text: &str, separators: &[char]) {
+        pending.extend(
+            text.split(separators)
+                .rev()
+                .filter(|component| !matches!(*component, "" | "."))
+                .map(str::to_string),
+        );
+    }
+
+    /// Removes the last component (and its separator) from `resolved`.
+    fn pop_component(resolved: &mut String, starts: &mut Vec<usize>) -> bool {
+        let Some(start) = starts.pop() else {
+            return false;
+        };
+        resolved.truncate(start.saturating_sub(1));
+        true
+    }
+
+    let mut pending = Vec::new();
+    queue(&mut pending, path, &['/']);
+    // The resolved path so far, built in place, and where each of its components starts.
+    let mut resolved = String::new();
+    let mut starts: Vec<usize> = Vec::new();
     let mut hops = 0;
+    let mut steps = 0;
+
     while let Some(component) = pending.pop() {
-        match component.as_str() {
-            "" | "." => continue,
-            ".." => {
-                if resolved.pop().is_none() {
-                    return Err(if hops == 0 && !from_link {
-                        io::Error::new(
-                            ErrorKind::NotFound,
-                            format!("file not found in zip archive: {path}"),
-                        )
-                    } else {
-                        io::Error::new(
-                            ErrorKind::InvalidInput,
-                            "symlink target points outside the archive",
-                        )
-                    });
-                }
-                continue;
-            }
-            _ => {}
+        steps += 1;
+        if steps > MAX_WALK_COMPONENTS {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "path has too many components after following symlinks",
+            ));
         }
-        resolved.push(component);
-        let is_final = pending.iter().all(|rest| matches!(rest.as_str(), "" | "."));
-        if is_final && !follow_final {
+        if component == ".." {
+            if !pop_component(&mut resolved, &mut starts) {
+                return Err(if hops == 0 && !from_link {
+                    io::Error::new(
+                        ErrorKind::NotFound,
+                        format!("file not found in zip archive: {path}"),
+                    )
+                } else {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "symlink target points outside the archive",
+                    )
+                });
+            }
+            continue;
+        }
+
+        if !resolved.is_empty() {
+            resolved.push('/');
+        }
+        starts.push(resolved.len());
+        resolved.push_str(&component);
+
+        if pending.is_empty() && !follow_final {
             break;
         }
-        let Some(target) = symlink_target(&resolved.join("/"))? else {
+        let Some(target) = symlink_target(&resolved)? else {
             continue;
         };
         hops += 1;
@@ -178,10 +218,10 @@ pub(crate) fn resolve_walk(
             return Err(too_many_links());
         }
         let target = check_link_target(&target)?;
-        resolved.pop();
-        pending.extend(target.split(['/', '\\']).rev().map(str::to_string));
+        pop_component(&mut resolved, &mut starts);
+        queue(&mut pending, target, &['/', '\\']);
     }
-    Ok(resolved.join("/"))
+    Ok(resolved)
 }
 
 pub(crate) fn too_many_links() -> io::Error {
