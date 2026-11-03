@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-03
+
 First release as `zipfs-ng`, continuing `zipfs` 0.0.2. A rewrite around an in-house zip reader. `ZipFS` is still the crate's Lunchbox filesystem, but
 it is now optional and built on synchronous, zero-copy archive types that work without any
 async runtime.
@@ -66,5 +68,6 @@ async runtime.
 
 Last release of the original `zipfs` crate, an async filesystem over `async_zip`.
 
-[Unreleased]: https://github.com/sunsided/zipfs/commits/main
+[Unreleased]: https://github.com/sunsided/zipfs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sunsided/zipfs/releases/tag/v0.1.0
 [0.0.2]: https://crates.io/crates/zipfs/0.0.2
