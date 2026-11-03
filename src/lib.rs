@@ -13,6 +13,17 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
+
+pub mod archive;
+mod crc32;
+pub mod format;
+mod paths;
+mod reader;
+
+pub use archive::ZipArchive;
+pub use format::{EntryKind, Method, ZipSlice};
+pub use reader::EntryReader;
+
 use async_trait::async_trait;
 // async_zip 0.0.19 deprecates the `read::seek` module in favour of `read1`. Porting to `read1` is
 // a larger change (different entry types), so it is deferred. The deprecation is allowed at each

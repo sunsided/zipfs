@@ -32,6 +32,40 @@ async fn load() -> std::io::Result<()> {
 }
 ```
 
+# Synchronous, in-memory access
+
+For archives that are already in memory, such as assets embedded with `include_bytes!`, zipfs
+also has a synchronous API that needs no async runtime:
+
+- `ZipArchive<D>` indexes an archive held in any `AsRef<[u8]>` (`&'static [u8]`, `Vec<u8>`,
+  `Arc<[u8]>`, a memory map). Stored (uncompressed) files are returned borrowed, never copied;
+  compressed files are decompressed in pure Rust with size and CRC-32 checks.
+- `ZipSlice<'a>` is a view over `&'a [u8]` that allocates nothing: it walks the central
+  directory in place and borrows stored files for the lifetime of the bytes.
+
+```rust
+use zipfs::{ZipArchive, ZipSlice};
+
+fn load(assets: &'static [u8]) -> std::io::Result<()> {
+    // Indexed lookups; `read` borrows stored files and decompresses the rest.
+    let zip = ZipArchive::new(assets)?;
+    let config = zip.read_to_string("config/game.json")?;
+    let sprite: &'static [u8] = zip.read_borrowed("images/sprite.png")?;
+    for entry in zip.read_dir("images")? {
+        println!("{} ({:?})", entry.name, entry.kind);
+    }
+
+    // No allocation at all; stored files only.
+    let slice = ZipSlice::new(assets)?;
+    let music: &'static [u8] = slice.get("audio/theme.ogg")?;
+    Ok(())
+}
+```
+
+Both follow symlinks in the final path component. Pack assets with already-compressed formats
+(PNG, OGG, KTX2) stored, e.g. `zip -r -n .png:.ogg:.ktx2 assets.zip assets/`, to get them without
+copying.
+
 # Compression features
 
 | Feature   | Default | Enables                                                  |
