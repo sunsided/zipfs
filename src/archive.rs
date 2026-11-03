@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::time::SystemTime;
 
 use crate::format::{self, EntryKind, Method, ZipSlice};
-use crate::paths::{self, normalize};
+use crate::index::{Index, IndexedEntry, LinkTargets};
 use crate::reader::{self, EntryReader};
 
 /// A zip archive held in memory, with an index for fast lookups.
@@ -32,35 +32,13 @@ use crate::reader::{self, EntryReader};
 /// ```
 pub struct ZipArchive<D> {
     data: D,
-    entries: Vec<IndexedEntry>,
-    /// Indices into `entries`, sorted by path, one per distinct path. When several entries share
-    /// a path, the last one in the central directory wins.
-    sorted: Vec<usize>,
-    /// Normalized paths of all entries, concatenated; `IndexedEntry::name` indexes into it.
-    names: String,
-    /// Whether any entry is a symlink; with `full-symlinks`, paths are only walked component
-    /// by component when there is something to follow.
-    #[cfg(feature = "full-symlinks")]
-    has_symlinks: bool,
+    index: Index,
     /// Largest uncompressed size that `read` decompresses in one call; see
     /// [`ZipArchive::with_one_shot_limit`].
     one_shot_limit: u64,
     /// Whether borrowed reads of stored files check their CRC-32; see
     /// [`ZipArchive::with_verified_stored_reads`].
     verify_stored: bool,
-}
-
-#[derive(Debug, Clone)]
-struct IndexedEntry {
-    name: Range<usize>,
-    kind: EntryKind,
-    method: Method,
-    crc32: u32,
-    compressed_size: u64,
-    uncompressed_size: u64,
-    local_header_offset: u64,
-    modified: Option<SystemTime>,
-    unix_mode: Option<u32>,
 }
 
 /// Where a file's (possibly compressed) contents live in the archive data.
@@ -109,74 +87,10 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     /// malformed or an entry name escapes the archive root (e.g. `../evil`).
     pub fn new(data: D) -> io::Result<Self> {
         let slice = ZipSlice::new(data.as_ref())?;
-        let capacity = usize::try_from(slice.entry_count()).unwrap_or(0);
-        let mut entries = Vec::with_capacity(capacity);
-        let mut names = String::new();
-
-        for entry in slice.entries() {
-            let entry = entry?;
-            let raw_name = entry.name()?;
-            let path = paths::normalize_entry_name(&raw_name).ok_or_else(|| {
-                format::invalid(&format!(
-                    "entry name is not a portable relative path (NUL, drive letter or escapes the archive root): {raw_name:?}"
-                ))
-            })?;
-            if path.is_empty() {
-                // An entry for the root directory itself (`/` or `./`).
-                continue;
-            }
-
-            let kind = entry.kind();
-            if kind != EntryKind::Directory {
-                if entry.is_encrypted() {
-                    return Err(format::encrypted(&entry));
-                }
-                if !reader::is_supported(entry.method()) {
-                    return Err(reader::unsupported_method(entry.method()));
-                }
-            }
-
-            let start = names.len();
-            names.push_str(&path);
-            entries.push(IndexedEntry {
-                name: start..names.len(),
-                kind,
-                method: entry.method(),
-                crc32: entry.crc32(),
-                compressed_size: entry.compressed_size(),
-                uncompressed_size: entry.size(),
-                local_header_offset: entry.local_header_offset(),
-                modified: entry.modified(),
-                unix_mode: entry.unix_mode(),
-            });
-        }
-
-        // Sort by path, keeping central directory order among equal paths, then keep the last
-        // entry of each run of equal paths.
-        let mut sorted: Vec<usize> = (0..entries.len()).collect();
-        sorted
-            .sort_by(|&a, &b| names[entries[a].name.clone()].cmp(&names[entries[b].name.clone()]));
-        let mut deduplicated: Vec<usize> = Vec::with_capacity(sorted.len());
-        for index in sorted {
-            match deduplicated.last_mut() {
-                Some(last)
-                    if names[entries[*last].name.clone()] == names[entries[index].name.clone()] =>
-                {
-                    *last = index;
-                }
-                _ => deduplicated.push(index),
-            }
-        }
-
-        #[cfg(feature = "full-symlinks")]
-        let has_symlinks = entries.iter().any(|entry| entry.kind == EntryKind::Symlink);
+        let index = Index::build(slice.entries(), slice.entry_count())?;
         Ok(Self {
             data,
-            entries,
-            sorted: deduplicated,
-            #[cfg(feature = "full-symlinks")]
-            has_symlinks,
-            names,
+            index,
             one_shot_limit: u64::MAX,
             verify_stored: false,
         })
@@ -209,13 +123,11 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     /// The first failure is returned, with the path in its message. Useful once at startup to
     /// trust an asset archive before serving borrowed, unchecked reads from it.
     pub fn verify_all(&self) -> io::Result<()> {
-        for &index in &self.sorted {
-            let entry = &self.entries[index];
+        for (path, entry) in self.index.iter() {
             if entry.kind == EntryKind::Directory {
                 continue;
             }
-            let with_path =
-                |err: io::Error| io::Error::new(err.kind(), format!("{}: {err}", self.name(index)));
+            let with_path = |err: io::Error| io::Error::new(err.kind(), format!("{path}: {err}"));
             let raw = self.raw_data(entry).map_err(with_path)?;
             let mut reader =
                 EntryReader::new(raw, entry.method, entry.uncompressed_size, entry.crc32)
@@ -262,18 +174,18 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
 
     /// Number of distinct paths with their own entry (implicit directories are not counted).
     pub fn len(&self) -> usize {
-        self.sorted.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sorted.is_empty()
+        self.index.len() == 0
     }
 
     /// Iterates over all entries in path order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, Metadata)> + '_ {
-        self.sorted
+        self.index
             .iter()
-            .map(|&index| (self.name(index), self.entry_metadata(&self.entries[index])))
+            .map(|(path, entry)| (path, Index::entry_metadata(entry)))
     }
 
     /// Whether `path` exists, following symlinks.
@@ -287,7 +199,7 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     /// copying (and without a CRC-32 check, which would mean reading them); compressed files
     /// are decompressed into a new, verified buffer.
     pub fn read(&self, path: &str) -> io::Result<Cow<'_, [u8]>> {
-        let entry = self.resolve_file(path)?;
+        let entry = self.index.resolve_file(path, self)?;
         self.entry_bytes(entry)
     }
 
@@ -306,228 +218,39 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     /// The reader decompresses on the fly and verifies size and CRC-32 at the end, for stored
     /// entries too.
     pub fn open(&self, path: &str) -> io::Result<EntryReader<'_>> {
-        let entry = self.resolve_file(path)?;
+        let entry = self.index.resolve_file(path, self)?;
         let raw = self.raw_data(entry)?;
         EntryReader::new(raw, entry.method, entry.uncompressed_size, entry.crc32)
     }
 
     /// Returns metadata, following symlinks.
     pub fn metadata(&self, path: &str) -> io::Result<Metadata> {
-        let (path, entry) = self.resolve(path)?;
-        self.metadata_for(&path, entry)
+        self.index.metadata(path, self)
     }
 
     /// Returns metadata without following a symlink in the final path component.
     pub fn symlink_metadata(&self, path: &str) -> io::Result<Metadata> {
-        let path = self.resolve_parent(path)?;
-        self.metadata_for(&path, self.find(&path))
+        self.index.symlink_metadata(path, self)
     }
 
     /// Returns the target of a symlink as a normalized path from the archive root.
     pub fn read_link(&self, path: &str) -> io::Result<String> {
-        let path = self.resolve_parent(path)?;
-        let entry = self.find(&path).ok_or_else(|| not_found(&path))?;
-        if entry.kind != EntryKind::Symlink {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "not a symlink"));
-        }
-        #[cfg(feature = "full-symlinks")]
-        if self.has_symlinks {
-            paths::check_link_target_size(&path, entry.uncompressed_size)?;
-            let target = self.entry_bytes(entry)?;
-            let target = paths::check_link_target(&target)?.replace('\\', "/");
-            let joined = format!("{}/{target}", paths::parent(&path));
-            return paths::resolve_walk(&joined, false, true, |p| self.symlink_target_bytes(p));
-        }
-        self.link_target(&path, entry)
+        self.index.read_link(path, self)
     }
 
-    /// Resolves symlinks in the final path component and normalizes the path.
+    /// Resolves symlinks in the final path component (in every component with the
+    /// `full-symlinks` feature) and normalizes the path.
     ///
     /// Paths that do not exist are returned normalized but otherwise unchanged.
     pub fn canonicalize(&self, path: &str) -> io::Result<String> {
-        Ok(self.resolve(path)?.0.into_owned())
-    }
-
-    /// Normalizes `path` and follows symlinks in its final component, returning the resolved
-    /// path and its entry (`None` for implicit directories and paths that do not exist).
-    ///
-    /// The path stays borrowed unless normalization or a symlink changed it, so lookups of
-    /// plain paths do not allocate.
-    fn resolve<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Option<&IndexedEntry>)> {
-        #[cfg(feature = "full-symlinks")]
-        if self.has_symlinks {
-            let resolved =
-                paths::resolve_walk(path, true, false, |p| self.symlink_target_bytes(p))?;
-            let entry = self.find(&resolved);
-            return Ok((Cow::Owned(resolved), entry));
-        }
-        let mut current = normalize(path).ok_or_else(|| not_found(path))?;
-        for _ in 0..paths::MAX_SYMLINK_HOPS {
-            match self.find(&current) {
-                Some(entry) if entry.kind == EntryKind::Symlink => {
-                    current = Cow::Owned(self.link_target(&current, entry)?);
-                }
-                entry => return Ok((current, entry)),
-            }
-        }
-        Err(paths::too_many_links())
+        self.index.canonicalize(path, self)
     }
 
     /// Lists the direct children of a directory, sorted by name.
     ///
     /// Directories that only exist implicitly (because files below them do) are listed too.
     pub fn read_dir(&self, path: &str) -> io::Result<Vec<DirEntry<'_>>> {
-        let base = self.canonicalize(path)?;
-        if !self.is_dir(&base) {
-            return Err(match self.find(&base) {
-                Some(_) => {
-                    io::Error::new(ErrorKind::NotADirectory, format!("not a directory: {base}"))
-                }
-                None => not_found(&base),
-            });
-        }
-
-        let prefix = if base.is_empty() {
-            String::new()
-        } else {
-            format!("{base}/")
-        };
-        let mut children = Vec::new();
-        for &index in &self.sorted[self.lower_bound(&prefix)..] {
-            let name = self.name(index);
-            let Some(rest) = name.strip_prefix(prefix.as_str()) else {
-                break;
-            };
-            let child = match rest.split_once('/') {
-                Some((directory, _)) => DirEntry {
-                    name: directory,
-                    kind: EntryKind::Directory,
-                },
-                None => DirEntry {
-                    name: rest,
-                    kind: self.entries[index].kind,
-                },
-            };
-            children.push(child);
-        }
-        // Names of implicit directories can repeat and interleave with sibling files; prefer
-        // the directory when a name appears both ways.
-        children.sort_by(|a, b| {
-            a.name.cmp(b.name).then_with(|| {
-                (a.kind != EntryKind::Directory).cmp(&(b.kind != EntryKind::Directory))
-            })
-        });
-        children.dedup_by(|later, earlier| later.name == earlier.name);
-        Ok(children)
-    }
-
-    fn name(&self, index: usize) -> &str {
-        &self.names[self.entries[index].name.clone()]
-    }
-
-    /// Position of the first path not less than `key` in `sorted`.
-    fn lower_bound(&self, key: &str) -> usize {
-        self.sorted.partition_point(|&index| self.name(index) < key)
-    }
-
-    fn find(&self, normalized: &str) -> Option<&IndexedEntry> {
-        self.sorted
-            .binary_search_by(|&index| self.name(index).cmp(normalized))
-            .ok()
-            .map(|position| &self.entries[self.sorted[position]])
-    }
-
-    fn is_dir(&self, normalized: &str) -> bool {
-        normalized.is_empty()
-            || self
-                .find(normalized)
-                .is_some_and(|entry| entry.kind == EntryKind::Directory)
-            || self.has_children(normalized)
-    }
-
-    /// Whether any entry lies below the normalized, non-empty directory path `dir`.
-    ///
-    /// Compares against `dir` followed by `/` without building that string.
-    fn has_children(&self, dir: &str) -> bool {
-        let key = || dir.bytes().chain(std::iter::once(b'/'));
-        let start = self
-            .sorted
-            .partition_point(|&index| self.name(index).bytes().lt(key()));
-        self.sorted.get(start).is_some_and(|&index| {
-            let name = self.name(index).as_bytes();
-            name.len() > dir.len() && name.starts_with(dir.as_bytes()) && name[dir.len()] == b'/'
-        })
-    }
-
-    fn entry_metadata(&self, entry: &IndexedEntry) -> Metadata {
-        Metadata {
-            kind: entry.kind,
-            len: entry.uncompressed_size,
-            compressed_len: entry.compressed_size,
-            method: Some(entry.method),
-            modified: entry.modified,
-            unix_mode: entry.unix_mode,
-        }
-    }
-
-    /// Metadata for a normalized path whose entry (if any) has already been looked up.
-    fn metadata_for(&self, normalized: &str, entry: Option<&IndexedEntry>) -> io::Result<Metadata> {
-        if let Some(entry) = entry {
-            return Ok(self.entry_metadata(entry));
-        }
-        if normalized.is_empty() || self.has_children(normalized) {
-            return Ok(Metadata {
-                kind: EntryKind::Directory,
-                len: 0,
-                compressed_len: 0,
-                method: None,
-                modified: None,
-                unix_mode: None,
-            });
-        }
-        Err(not_found(normalized))
-    }
-
-    fn resolve_file(&self, path: &str) -> io::Result<&IndexedEntry> {
-        let (path, entry) = self.resolve(path)?;
-        match entry {
-            Some(entry) if entry.kind == EntryKind::File => Ok(entry),
-            Some(_) => Err(is_a_directory(&path)),
-            None if self.is_dir(&path) => Err(is_a_directory(&path)),
-            None => Err(not_found(&path)),
-        }
-    }
-
-    /// Reads a symlink entry's target and resolves it relative to the link's directory.
-    /// Normalizes `path` and, with `full-symlinks`, follows symlinks in every component but the
-    /// last; for operations on a symlink itself (`symlink_metadata`, `read_link`).
-    fn resolve_parent<'p>(&self, path: &'p str) -> io::Result<Cow<'p, str>> {
-        #[cfg(feature = "full-symlinks")]
-        if self.has_symlinks {
-            return paths::resolve_walk(path, false, false, |p| self.symlink_target_bytes(p))
-                .map(Cow::Owned);
-        }
-        normalize(path).ok_or_else(|| not_found(path))
-    }
-
-    /// The raw target of the entry at a normalized path, if it is a symlink.
-    #[cfg(feature = "full-symlinks")]
-    fn symlink_target_bytes(&self, normalized: &str) -> io::Result<Option<Vec<u8>>> {
-        match self.find(normalized) {
-            Some(entry) if entry.kind == EntryKind::Symlink => {
-                paths::check_link_target_size(normalized, entry.uncompressed_size)?;
-                Ok(Some(self.entry_bytes(entry)?.into_owned()))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn link_target(&self, link_path: &str, entry: &IndexedEntry) -> io::Result<String> {
-        // The declared size bounds the bytes actually read: `EntryReader` fails on any output
-        // beyond it, and stored slices are exactly the declared size.
-        paths::check_link_target_size(link_path, entry.uncompressed_size)?;
-        let bytes = self.entry_bytes(entry)?;
-        paths::resolve_link(link_path, &bytes)
+        self.index.read_dir(path, self)
     }
 
     fn raw_data(&self, entry: &IndexedEntry) -> io::Result<&[u8]> {
@@ -564,7 +287,7 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     /// readers that keep their own handle to the data (such as `ZipFS` files).
     #[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
     pub(crate) fn locate_file(&self, path: &str) -> io::Result<FileLocation> {
-        let entry = self.resolve_file(path)?;
+        let entry = self.index.resolve_file(path, self)?;
         let range = format::data_range(
             self.data.as_ref(),
             entry.local_header_offset,
@@ -577,7 +300,7 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
             method: entry.method,
             uncompressed_size: entry.uncompressed_size,
             crc32: entry.crc32,
-            metadata: self.entry_metadata(entry),
+            metadata: Index::entry_metadata(entry),
             verify: self.verify_stored,
         })
     }
@@ -589,7 +312,7 @@ impl<'a> ZipArchive<&'a [u8]> {
     /// The returned slice outlives the `ZipArchive` itself. Fails with
     /// [`ErrorKind::Unsupported`] for compressed entries; use [`read`](Self::read) for those.
     pub fn read_borrowed(&self, path: &str) -> io::Result<&'a [u8]> {
-        let entry = self.resolve_file(path)?;
+        let entry = self.index.resolve_file(path, self)?;
         if entry.method != Method::Stored {
             return Err(io::Error::new(
                 ErrorKind::Unsupported,
@@ -615,15 +338,10 @@ impl<'a> ZipArchive<&'a [u8]> {
     }
 }
 
-fn not_found(path: &str) -> io::Error {
-    io::Error::new(
-        ErrorKind::NotFound,
-        format!("file not found in zip archive: {path}"),
-    )
-}
-
-fn is_a_directory(path: &str) -> io::Error {
-    io::Error::new(ErrorKind::IsADirectory, format!("is a directory: {path}"))
+impl<D: AsRef<[u8]>> LinkTargets for ZipArchive<D> {
+    fn link_target_bytes(&self, entry: &IndexedEntry) -> io::Result<Cow<'_, [u8]>> {
+        self.entry_bytes(entry)
+    }
 }
 
 fn not_utf8() -> io::Error {

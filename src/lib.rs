@@ -26,6 +26,7 @@
 pub mod archive;
 mod crc32;
 pub mod format;
+mod index;
 mod paths;
 mod reader;
 #[cfg(feature = "lunchbox")]
