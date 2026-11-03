@@ -142,7 +142,9 @@ impl<D: AsRef<[u8]> + Clone> File<D> {
         let mut state = self.lock();
         let FileState { position, stream } = &mut *state;
 
-        if location.method == Method::Stored {
+        // Stored files are served straight from the archive bytes, unless they must be checked
+        // against their CRC-32, in which case they go through the decoder like compressed ones.
+        if location.method == Method::Stored && !location.verify {
             let contents = &self.data.as_ref()[location.range.clone()];
             let start = usize::try_from(*position)
                 .unwrap_or(usize::MAX)
@@ -498,6 +500,44 @@ mod tests {
         assert_eq!(contents, "d");
         assert!(file.seek(SeekFrom::Current(-5)).await.is_err());
         assert!(file.metadata().await.unwrap().is_file());
+    }
+
+    #[tokio::test]
+    async fn verified_stored_reads_check_the_crc() {
+        use tokio::io::AsyncSeekExt;
+
+        // stored_only.zip with the CRC-32 of its first entry (readme.txt) altered.
+        let mut bytes = STORED.to_vec();
+        let crc_at = 14; // local header
+        bytes[crc_at] ^= 0xFF;
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 16] ^= 0xFF;
+        let bytes: &'static [u8] = bytes.leak();
+
+        let fs = ZipFS::new(bytes).unwrap();
+        assert_eq!(
+            read_file(&fs, "readme.txt").await,
+            "hello from a stored zip\n"
+        );
+
+        let fs = ZipFS::from(
+            ZipArchive::new(bytes)
+                .unwrap()
+                .with_verified_stored_reads(true),
+        );
+        let mut file = fs.open("readme.txt").await.unwrap();
+        let mut contents = Vec::new();
+        let err = file.read_to_end(&mut contents).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Intact stored files still read, and seeking works through the checking path.
+        let mut file = fs.open("images/sprite.png").await.unwrap();
+        file.seek(SeekFrom::Start(1)).await.unwrap();
+        let mut rest = Vec::new();
+        file.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"PNG\r\n\x1a\nnot-really-a-png");
     }
 
     #[tokio::test]
