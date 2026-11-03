@@ -486,11 +486,19 @@ impl<'a> Entry<'a> {
         }
     }
 
-    /// Unix permission and file type bits, if the entry was written on a Unix-like system.
+    /// Unix permission and file type bits, if the archive records them.
+    ///
+    /// Unix and macOS writers store the mode in the upper 16 bits of the external attributes.
+    /// Windows writers (the `zip` crate among them) mark entries as made by MS-DOS but often
+    /// store a Unix mode there too, which is the only way to recognize their symlinks; for
+    /// other hosts the bits are used when they name a valid Unix file type.
     pub fn unix_mode(&self) -> Option<u32> {
         let host = (self.version_made_by >> 8) as u8;
         let mode = self.external_attributes >> 16;
-        (matches!(host, HOST_UNIX | HOST_OSX) && mode != 0).then_some(mode)
+        if mode == 0 {
+            return None;
+        }
+        (matches!(host, HOST_UNIX | HOST_OSX) || is_unix_file_type(mode)).then_some(mode)
     }
 
     /// Uncompressed size in bytes.
@@ -534,6 +542,15 @@ impl<'a> Entry<'a> {
     pub(crate) fn local_header_offset(&self) -> u64 {
         self.local_header_offset
     }
+}
+
+/// Whether `mode` carries one of the Unix file types (FIFO, character device, directory, block
+/// device, regular file, symlink, socket).
+fn is_unix_file_type(mode: u32) -> bool {
+    matches!(
+        mode & S_IFMT,
+        0o010_000 | 0o020_000 | S_IFDIR | 0o060_000 | 0o100_000 | S_IFLNK | 0o140_000
+    )
 }
 
 /// Finds the byte range of an entry's data by reading its local file header.

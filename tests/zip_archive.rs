@@ -192,6 +192,8 @@ struct Hand<'a> {
     mode: u32,
     /// Uncompressed size when `data` is compressed; defaults to `data.len()`.
     uncompressed_size: Option<u32>,
+    /// "Version made by" host system: 3 is Unix, 0 is MS-DOS (used by Windows writers).
+    host: u8,
 }
 
 impl<'a> Hand<'a> {
@@ -206,6 +208,7 @@ impl<'a> Hand<'a> {
             extra: Vec::new(),
             mode: 0o100_644,
             uncompressed_size: None,
+            host: 3,
         }
     }
 
@@ -265,7 +268,7 @@ fn build(entries: &[Hand<'_>], prefix: &[u8]) -> Vec<u8> {
         }
         extra.extend_from_slice(&entry.extra);
         central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        central.extend_from_slice(&((3u16 << 8) | 63).to_le_bytes()); // made by: Unix
+        central.extend_from_slice(&((u16::from(entry.host) << 8) | 63).to_le_bytes()); // made by
         central.extend_from_slice(&45u16.to_le_bytes());
         central.extend_from_slice(&entry.flags.to_le_bytes());
         central.extend_from_slice(&entry.method.to_le_bytes());
@@ -557,6 +560,44 @@ fn non_portable_names_are_rejected() {
         assert_eq!(slice.entries().count(), 1);
         assert!(slice.find("evil.dll").unwrap().is_none());
     }
+}
+
+/// Windows writers (the `zip` crate among them) mark entries as made by MS-DOS but still store
+/// the Unix mode in the upper 16 bits of the external attributes; that is the only way to
+/// recognize symlinks in such archives.
+#[test]
+fn unix_modes_from_windows_writers_are_used() {
+    let mut file = Hand::file(b"dir/a.txt", b"payload");
+    file.host = 0;
+    let mut link = Hand::symlink(b"link", b"dir/a.txt");
+    link.host = 0;
+    let bytes = build(&[file, link], b"");
+
+    assert_matches_reference(&bytes[..]);
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(
+        zip.symlink_metadata("link").unwrap().kind,
+        EntryKind::Symlink
+    );
+    assert_eq!(
+        zip.symlink_metadata("link").unwrap().unix_mode,
+        Some(0o120_777)
+    );
+    assert_eq!(&*zip.read("link").unwrap(), b"payload");
+    assert_eq!(
+        ZipSlice::new(&bytes).unwrap().get("link").unwrap(),
+        b"payload"
+    );
+
+    // Upper bits that do not name a file type are not taken as a mode (the zip crate trusts any
+    // non-zero value, so this case is not compared against it).
+    let mut noise = Hand::file(b"noise.txt", b"x");
+    noise.host = 0;
+    noise.mode = 0xFFFF; // File type bits 0o170000: not a valid type.
+    let bytes = build(&[noise], b"");
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(zip.metadata("noise.txt").unwrap().unix_mode, None);
+    assert_eq!(zip.metadata("noise.txt").unwrap().kind, EntryKind::File);
 }
 
 #[test]
