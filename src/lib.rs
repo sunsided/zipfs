@@ -72,24 +72,57 @@ impl<T> ZipFS<T>
 where
     T: GetReader,
 {
-    pub async fn new(factory: T) -> ZipFS<T> {
+    /// Opens the archive and reads its central directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Unsupported`] if any entry uses a compression method whose
+    /// crate feature is disabled (e.g. a Deflate entry when built without `deflate`).
+    /// With `default-features = false` this means every entry must be Stored (uncompressed).
+    ///
+    /// Returns [`ErrorKind::InvalidData`] if the archive cannot be parsed.
+    pub async fn new(factory: T) -> Result<ZipFS<T>> {
         let zip = ZipFileReader::new(BufReader::new(factory.get().await).compat())
             .await
-            .unwrap();
+            .map_err(zip_error_to_io)?;
 
         // This makes a copy of each entry, but that's probably ok
         let entries = zip
             .file()
             .entries()
-            .into_iter()
+            .iter()
             .map(|e| e.deref().clone())
             .collect();
 
-        Self {
+        Ok(Self {
             factory,
             zip_info: zip.file().clone(),
             entries,
+        })
+    }
+}
+
+/// Converts an archive-level error from `async_zip` into an `std::io::Error`.
+fn zip_error_to_io(err: async_zip::error::ZipError) -> std::io::Error {
+    use async_zip::error::ZipError;
+
+    match err {
+        ZipError::CompressionNotSupported(method) => {
+            let (name, feature) = match method {
+                8 => ("Deflate", Some("deflate")),
+                93 => ("Zstandard", Some("zstd")),
+                _ => ("an unsupported method", None),
+            };
+            let hint = match feature {
+                Some(feature) => format!("enable the `{feature}` feature of zipfs"),
+                None => "zipfs cannot read this method".to_string(),
+            };
+            std::io::Error::new(
+                ErrorKind::Unsupported,
+                format!("zip archive contains an entry compressed with {name} (method {method}); {hint}, or repack the archive with stored (uncompressed) entries"),
+            )
         }
+        other => std::io::Error::new(ErrorKind::InvalidData, other),
     }
 }
 
@@ -463,7 +496,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_symlink() {
-        let zip = ZipFS::new(get_test_data_dir().join("external_symlink.zip")).await;
+        let zip = ZipFS::new(get_test_data_dir().join("external_symlink.zip"))
+            .await
+            .unwrap();
 
         assert!(zip.read_link("/symlink_to_etc_passwd").await.is_err());
         assert!(zip.open("/symlink_to_etc_passwd").await.is_err())
@@ -480,9 +515,13 @@ mod tests {
         str
     }
 
+    // `symlink_test.zip` contains Deflate-compressed files.
+    #[cfg(feature = "deflate")]
     #[tokio::test]
     async fn test_symlinks() {
-        let zip = ZipFS::new(get_test_data_dir().join("symlink_test.zip")).await;
+        let zip = ZipFS::new(get_test_data_dir().join("symlink_test.zip"))
+            .await
+            .unwrap();
 
         assert!(zip.metadata("a/a.txt").await.unwrap().is_file());
         assert!(zip.symlink_metadata("a/a.txt").await.unwrap().is_file());
@@ -523,5 +562,34 @@ mod tests {
         assert_eq!(read_file(&zip, "b/symlink_to_d.txt").await, "d");
         assert_eq!(read_file(&zip, "symlink_to_d.txt").await, "d");
         assert_eq!(read_file(&zip, "/symlink_to_d.txt").await, "d");
+    }
+
+    #[tokio::test]
+    async fn test_stored_only() {
+        let zip = ZipFS::new(get_test_data_dir().join("stored_only.zip"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_file(&zip, "readme.txt").await,
+            "hello from a stored zip\n"
+        );
+        assert!(zip.metadata("images").await.unwrap().is_dir());
+
+        let sprite = zip.read("images/sprite.png").await.unwrap();
+        assert!(sprite.starts_with(b"\x89PNG"));
+        assert_eq!(sprite.len(), 24);
+    }
+
+    #[cfg(not(feature = "deflate"))]
+    #[tokio::test]
+    async fn test_compressed_archive_rejected_without_deflate() {
+        let err = match ZipFS::new(get_test_data_dir().join("symlink_test.zip")).await {
+            Ok(_) => panic!("archive with Deflate entries must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("`deflate` feature"), "{err}");
     }
 }

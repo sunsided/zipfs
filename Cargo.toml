@@ -13,10 +13,19 @@ categories = ["filesystem", "asynchronous", "compression"]
 tokio = { version = "1", features = ["io-util"] }
 lunchbox = { version = "0.1", default-features = false }
 async-trait = "0.1"
-async_zip = { version = "0.0.19", default-features = false, features = ["chrono", "deflate", "zstd"] }
+async_zip = { version = "0.0.19", default-features = false, features = ["chrono"] }
 pin-project = "1"
 path-clean = "0.1"
 tokio-util = { version = "0.7", features = ["compat"] }
+
+[features]
+default = ["deflate", "zstd"]
+# Decompress entries stored with the Deflate method (what most zip tools produce).
+deflate = ["async_zip/deflate"]
+# Decompress entries stored with the Zstandard method. Pulls in the C `zstd` library.
+zstd = ["async_zip/zstd"]
+# With `default-features = false`, only uncompressed (Stored) entries are supported and
+# `ZipFS::new` returns an `ErrorKind::Unsupported` error for archives containing anything else.
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["io-util", "fs"] }
