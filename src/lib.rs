@@ -264,7 +264,7 @@ where
         <ZipFS<T> as HasFileType>::FileType: ReadableFile,
     {
         // Normalize the path
-        let path: PathBuf = path_clean::clean(path.as_ref().as_str()).into();
+        let path: PathBuf = path.as_ref().normalize();
 
         let found = self
             .entries
@@ -325,7 +325,7 @@ where
         let mut visited = HashSet::new();
         loop {
             // Normalize the path
-            path = path_clean::clean(path.as_str()).into();
+            path = path.normalize();
 
             // Return an error if we've already visited this path
             if visited.contains(&path) {
@@ -427,7 +427,7 @@ where
                 let target = path.parent().unwrap().join(target);
 
                 // Normalize the final path
-                let target = path_clean::clean(target.as_str()).into();
+                let target = target.normalize();
                 Ok(target)
             }
         } else {
