@@ -2,7 +2,7 @@
 name = "zipfs"
 version = "0.0.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Vivek Panyam <hello@vivekpanyam.com>"]
 description = "An async filesystem on top of Zip files."
 license = "Apache-2.0"
@@ -17,13 +17,17 @@ async-trait = "0.1"
 async_zip = { version = "0.0.19", default-features = false, features = ["chrono"] }
 pin-project = "1"
 tokio-util = { version = "0.7", features = ["compat"] }
+# Pure-Rust decoders for the synchronous reader (`ZipArchive`).
+miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
+ruzstd = { version = "0.9", optional = true, default-features = false, features = ["std"] }
 
 [features]
 default = ["deflate", "zstd"]
 # Decompress entries stored with the Deflate method (what most zip tools produce).
-deflate = ["async_zip/deflate"]
-# Decompress entries stored with the Zstandard method. Pulls in the C `zstd` library.
-zstd = ["async_zip/zstd"]
+deflate = ["async_zip/deflate", "dep:miniz_oxide"]
+# Decompress entries stored with the Zstandard method. `ZipArchive` uses the pure-Rust `ruzstd`;
+# the async `ZipFS` still uses async_zip, which pulls in the C `zstd` library.
+zstd = ["async_zip/zstd", "dep:ruzstd"]
 # With `default-features = false`, only uncompressed (Stored) entries are supported and
 # `ZipFS::new` returns an `ErrorKind::Unsupported` error for archives containing anything else.
 
@@ -32,3 +36,5 @@ tokio = { version = "1", features = ["io-util", "fs"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# Reference implementation for differential tests of the synchronous reader.
+zip = { version = "7.3", default-features = false, features = ["deflate", "zstd"] }
