@@ -139,11 +139,13 @@ fn zip_error_to_io(err: async_zip::error::ZipError) -> std::io::Error {
 pub struct File<R> {
     entry: ZipEntry,
 
+    /// Opens the entry reader on first read; `None` once it has completed.
     #[cfg(not(target_family = "wasm"))]
-    loader: Pin<Box<dyn Future<Output = R> + Send + Sync>>,
+    loader: Option<Pin<Box<dyn Future<Output = Result<R>> + Send + Sync>>>,
 
+    /// Opens the entry reader on first read; `None` once it has completed.
     #[cfg(target_family = "wasm")]
-    loader: Pin<Box<dyn Future<Output = R>>>,
+    loader: Option<Pin<Box<dyn Future<Output = Result<R>>>>>,
 
     #[pin]
     inner: Option<R>,
@@ -161,8 +163,19 @@ where
     ) -> std::task::Poll<std::io::Result<()>> {
         // Lazy load the reader
         if self.inner.is_none() {
-            match self.loader.as_mut().poll(cx) {
-                Poll::Ready(r) => self.inner = Some(r),
+            let Some(loader) = self.loader.as_mut() else {
+                // The loader already failed; its error was returned by an earlier read.
+                return Poll::Ready(Err(std::io::Error::other("zip entry could not be opened")));
+            };
+            match loader.as_mut().poll(cx) {
+                Poll::Ready(Ok(r)) => {
+                    self.loader = None;
+                    self.inner = Some(r);
+                }
+                Poll::Ready(Err(err)) => {
+                    self.loader = None;
+                    return Poll::Ready(Err(err));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -297,10 +310,11 @@ where
 
         Ok(File {
             inner: None,
-            loader: Box::pin(async move {
+            loader: Some(Box::pin(async move {
                 // Turn it into an entry reader
-                zip.into_entry(entry_idx).await.unwrap().compat()
-            }),
+                let reader = zip.into_entry(entry_idx).await.map_err(zip_error_to_io)?;
+                Ok(reader.compat())
+            })),
             entry: entry.clone(),
         })
     }
@@ -650,5 +664,25 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_entry_open_errors_are_returned() {
+        // Central directory intact, first local header signature corrupted.
+        let zip = ZipFS::new(get_test_data_dir().join("corrupt_local_header.zip"))
+            .await
+            .unwrap();
+
+        let err = zip.read("readme.txt").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+
+        // Reading the same file again after the failure must error, not panic.
+        let mut file = zip.open("readme.txt").await.unwrap();
+        let mut buf = Vec::new();
+        assert!(file.read_to_end(&mut buf).await.is_err());
+        assert!(file.read_to_end(&mut buf).await.is_err());
+
+        // Other entries are unaffected.
+        assert!(zip.read("images/sprite.png").await.is_ok());
     }
 }
