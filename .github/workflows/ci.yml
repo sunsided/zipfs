@@ -6,33 +6,110 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_and_test_native:
-    name: Native Build ${{ matrix.os }}
+  test:
+    name: Test ${{ matrix.os }} (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os:
-          - macos-latest
           - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        name:
+          - default features
+          - no default features
+        include:
+          - name: default features
+            cargo_args: ""
+          - name: no default features
+            cargo_args: --no-default-features
     steps:
-      - uses: actions/checkout@v3
-      - run: cargo build --verbose
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo test
+        shell: bash
+        env:
+          CARGO_ARGS: ${{ matrix.cargo_args }}
+        run: |
+          # CARGO_ARGS holds zero or more flags, so word splitting is intended.
+          # shellcheck disable=SC2086
+          cargo test --verbose $CARGO_ARGS
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.85 --profile minimal && rustup default 1.85
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --verbose
       - run: cargo test --verbose --no-default-features
+
   build_wasm:
-    name: WASM Build ${{ matrix.target }}
+    name: WASM Build ${{ matrix.target }} (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - wasm32-wasip1
-          - wasm32-unknown-unknown
+        include:
+          - target: wasm32-unknown-unknown
+            name: default features
+            cargo_args: ""
+          - target: wasm32-unknown-unknown
+            name: no default features
+            cargo_args: --no-default-features
+          # zstd-sys compiles C code and needs a WASI sysroot (wasi-sdk) on wasm32-wasip1,
+          # so only the pure-Rust feature sets are built here.
+          - target: wasm32-wasip1
+            name: deflate only
+            cargo_args: --no-default-features --features deflate
+          - target: wasm32-wasip1
+            name: no default features
+            cargo_args: --no-default-features
     steps:
-      - uses: actions/checkout@v3
-      - run: rustup target add ${{ matrix.target }}
-      - run: cargo build --verbose --target ${{ matrix.target }}
-      - run: cargo build --verbose --target ${{ matrix.target }} --no-default-features
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --target "$TARGET" && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo build
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_ARGS: ${{ matrix.cargo_args }}
+        run: |
+          # CARGO_ARGS holds zero or more flags, so word splitting is intended.
+          # shellcheck disable=SC2086
+          cargo build --verbose --target "$TARGET" $CARGO_ARGS

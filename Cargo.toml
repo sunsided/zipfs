@@ -1,7 +1,8 @@
 [package]
 name = "zipfs"
 version = "0.0.2"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 authors = ["Vivek Panyam <hello@vivekpanyam.com>"]
 description = "An async filesystem on top of Zip files."
 license = "Apache-2.0"
@@ -15,7 +16,6 @@ lunchbox = { version = "0.1", default-features = false }
 async-trait = "0.1"
 async_zip = { version = "0.0.19", default-features = false, features = ["chrono"] }
 pin-project = "1"
-path-clean = "0.1"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 [features]

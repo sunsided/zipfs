@@ -27,7 +27,7 @@ use lunchbox::types::{
     DirEntry, FileType, HasFileType, MaybeSend, MaybeSync, Metadata, Permissions, ReadDir,
     ReadDirPoller, ReadableFile,
 };
-use lunchbox::{types::PathType, ReadableFileSystem};
+use lunchbox::{ReadableFileSystem, types::PathType};
 use pin_project::pin_project;
 use std::collections::HashSet;
 use std::future::Future;
@@ -125,7 +125,9 @@ fn zip_error_to_io(err: async_zip::error::ZipError) -> std::io::Error {
             };
             std::io::Error::new(
                 ErrorKind::Unsupported,
-                format!("zip archive contains an entry compressed with {name} (method {method}); {hint}, or repack the archive with stored (uncompressed) entries"),
+                format!(
+                    "zip archive contains an entry compressed with {name} (method {method}); {hint}, or repack the archive with stored (uncompressed) entries"
+                ),
             )
         }
         other => std::io::Error::new(ErrorKind::InvalidData, other),
@@ -217,22 +219,13 @@ where
         let is_file = !is_dir && !is_symlink;
 
         // We don't have accessed or created
-        let accessed = Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ZipFS does not support `accessed`",
-        ));
-        let created = Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ZipFS does not support `created`",
-        ));
+        let accessed = Err(std::io::Error::other("ZipFS does not support `accessed`"));
+        let created = Err(std::io::Error::other("ZipFS does not support `created`"));
 
         // Get the modified time from the zipfile
         let modified = match entry.last_modification_date().as_chrono().single() {
             Some(v) => Ok(v.into()),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No modification time available",
-            )),
+            None => Err(std::io::Error::other("No modification time available")),
         };
 
         // Finally, len is the uncompressed size
@@ -254,8 +247,7 @@ where
 
     async fn try_clone(&self) -> Result<Self> {
         // We don't support try_clone for now because it needs to share read and seek position with self
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "ZipFS does not currently support try_clone",
         ))
     }
@@ -283,7 +275,7 @@ where
         <ZipFS<T> as HasFileType>::FileType: ReadableFile,
     {
         // Normalize the path
-        let path: PathBuf = path_clean::clean(path.as_ref().as_str()).into();
+        let path: PathBuf = path.as_ref().normalize();
 
         let found = self
             .entries
@@ -297,7 +289,7 @@ where
                 return Err(std::io::Error::new(
                     ErrorKind::NotFound,
                     format!("File not found in zipfile: {path}"),
-                ))
+                ));
             }
         };
 
@@ -346,13 +338,12 @@ where
         let mut visited = HashSet::new();
         loop {
             // Normalize the path
-            path = path_clean::clean(path.as_str()).into();
+            path = path.normalize();
 
             // Return an error if we've already visited this path
             if visited.contains(&path) {
-                return Err(std::io::Error::new(
+                return Err(std::io::Error::other(
                     // TODO: use ErrorKind::FilesystemLoop once stable
-                    std::io::ErrorKind::Other,
                     "Found symlink loop",
                 ));
             }
@@ -448,7 +439,7 @@ where
                 let target = path.parent().unwrap().join(target);
 
                 // Normalize the final path
-                let target = path_clean::clean(target.as_str()).into();
+                let target = target.normalize();
                 Ok(target)
             }
         } else {
@@ -504,7 +495,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use lunchbox::{types::PathType, ReadableFileSystem};
+    use lunchbox::{ReadableFileSystem, types::PathType};
     use tokio::io::AsyncReadExt;
 
     use crate::ZipFS;
