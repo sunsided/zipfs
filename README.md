@@ -22,7 +22,7 @@ Requires Rust 1.87 or newer.
 
 ```toml
 [dependencies]
-zipfs = "0.0.2"
+zipfs = "0.1"
 ```
 
 ```rust
@@ -53,7 +53,7 @@ copying.
 ```toml
 [dependencies]
 lunchbox = "0.1"
-zipfs = { version = "0.0.2", features = ["lunchbox"] }
+zipfs = { version = "0.1", features = ["lunchbox"] }
 ```
 
 ```rust
@@ -112,7 +112,7 @@ To use zip files as plain, uncompressed containers, disable the default features
 
 ```toml
 [dependencies]
-zipfs = { version = "0.0.2", default-features = false }
+zipfs = { version = "0.1", default-features = false }
 ```
 
 Only stored (uncompressed) entries can then be read, no decompression code is compiled in, and
