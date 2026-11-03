@@ -55,6 +55,12 @@ impl<'a> EntryReader<'a> {
                 ),
                 input: raw,
             },
+            // ruzstd rejects frames whose window exceeds 128 MiB and grows its ring buffer as
+            // output is produced rather than allocating the window up front. Because `read`
+            // asks for at most the declared size plus one byte, decoder memory stays within
+            // the declared size plus one block (128 KiB). The window is not capped at the
+            // entry size: streaming encoders use the level's default window (2-8 MiB) even for
+            // small files.
             #[cfg(feature = "zstd")]
             Method::Zstd => Decoder::Zstd(Box::new(
                 ruzstd::decoding::StreamingDecoder::new(raw).map_err(|err| {
