@@ -219,22 +219,13 @@ where
         let is_file = !is_dir && !is_symlink;
 
         // We don't have accessed or created
-        let accessed = Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ZipFS does not support `accessed`",
-        ));
-        let created = Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ZipFS does not support `created`",
-        ));
+        let accessed = Err(std::io::Error::other("ZipFS does not support `accessed`"));
+        let created = Err(std::io::Error::other("ZipFS does not support `created`"));
 
         // Get the modified time from the zipfile
         let modified = match entry.last_modification_date().as_chrono().single() {
             Some(v) => Ok(v.into()),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No modification time available",
-            )),
+            None => Err(std::io::Error::other("No modification time available")),
         };
 
         // Finally, len is the uncompressed size
@@ -256,8 +247,7 @@ where
 
     async fn try_clone(&self) -> Result<Self> {
         // We don't support try_clone for now because it needs to share read and seek position with self
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "ZipFS does not currently support try_clone",
         ))
     }
@@ -352,9 +342,8 @@ where
 
             // Return an error if we've already visited this path
             if visited.contains(&path) {
-                return Err(std::io::Error::new(
+                return Err(std::io::Error::other(
                     // TODO: use ErrorKind::FilesystemLoop once stable
-                    std::io::ErrorKind::Other,
                     "Found symlink loop",
                 ));
             }
