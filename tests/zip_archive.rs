@@ -843,6 +843,10 @@ fn zip_slice_follows_symlinks() {
     assert_eq!(zip.get("dangling").unwrap_err().kind(), ErrorKind::NotFound);
     assert_eq!(zip.get("empty").unwrap_err().kind(), ErrorKind::InvalidData);
     assert_eq!(
+        zip.read_link("empty").unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(
         ZipArchive::new(&bytes[..])
             .unwrap()
             .read_link("empty")
