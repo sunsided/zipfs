@@ -112,81 +112,18 @@ impl<'a> ZipSlice<'a> {
     /// Fails with [`ErrorKind::InvalidData`] if `data` is not a zip archive and with
     /// [`ErrorKind::Unsupported`] for multi-disk archives.
     pub fn new(data: &'a [u8]) -> io::Result<Self> {
-        let eocd_at =
-            find_eocd(data).ok_or_else(|| invalid("end of central directory record not found"))?;
-        let eocd = &data[eocd_at..eocd_at + EOCD_LEN];
-        let comment_len = usize::from(u16_at(eocd, 20));
-        let comment = &data[eocd_at + EOCD_LEN..eocd_at + EOCD_LEN + comment_len];
-
-        let mut disk = u32::from(u16_at(eocd, 4));
-        let mut cd_disk = u32::from(u16_at(eocd, 6));
-        let mut entries_on_disk = u64::from(u16_at(eocd, 8));
-        let mut entry_count = u64::from(u16_at(eocd, 10));
-        let mut cd_size = u64::from(u32_at(eocd, 12));
-        let mut cd_offset = u64::from(u32_at(eocd, 16));
-        // The central directory must end where the records after it begin.
-        let mut cd_end = eocd_at as u64;
-
-        if let Some(locator_at) = eocd_at.checked_sub(ZIP64_LOCATOR_LEN) {
-            let locator = &data[locator_at..eocd_at];
-            if u32_at(locator, 0) == ZIP64_LOCATOR_SIGNATURE {
-                if u32_at(locator, 4) != 0 || u32_at(locator, 16) > 1 {
-                    return Err(multi_disk());
-                }
-                let record_offset = u64_at(locator, 8);
-                // With prepended data the stored offset is short by the prefix length. A v1
-                // record without extensible data sits right before the locator, so fall back
-                // to that position when the stored offset does not point at a record.
-                let candidates = [
-                    usize::try_from(record_offset).ok(),
-                    locator_at.checked_sub(ZIP64_EOCD_LEN),
-                ];
-                let record_at = candidates
-                    .into_iter()
-                    .flatten()
-                    .find(|&at| {
-                        slice(data, at, ZIP64_EOCD_LEN)
-                            .is_some_and(|r| u32_at(r, 0) == ZIP64_EOCD_SIGNATURE)
-                    })
-                    .ok_or_else(|| invalid("ZIP64 end of central directory record not found"))?;
-                let record = &data[record_at..record_at + ZIP64_EOCD_LEN];
-                disk = u32_at(record, 16);
-                cd_disk = u32_at(record, 20);
-                entries_on_disk = u64_at(record, 24);
-                entry_count = u64_at(record, 32);
-                cd_size = u64_at(record, 40);
-                cd_offset = u64_at(record, 48);
-                cd_end = record_at as u64;
-            }
-        }
-
-        if disk != 0 || cd_disk != 0 || entries_on_disk != entry_count {
-            return Err(multi_disk());
-        }
-
-        let stored_end = cd_offset
-            .checked_add(cd_size)
-            .ok_or_else(|| invalid("central directory size overflows"))?;
-        if stored_end > cd_end {
-            return Err(invalid("central directory overlaps its end record"));
-        }
-        let base_offset = cd_end - stored_end;
-        let cd_start = usize::try_from(cd_offset + base_offset).map_err(|_| out_of_bounds())?;
-        let cd_len = usize::try_from(cd_size).map_err(|_| out_of_bounds())?;
-        let central_directory = slice(data, cd_start, cd_len).ok_or_else(out_of_bounds)?;
-
-        if entry_count > (cd_size / CENTRAL_HEADER_LEN as u64) {
-            return Err(invalid(
-                "entry count does not fit in the central directory size",
-            ));
-        }
-
+        let location = locate_central_directory(data, 0, None)?;
+        let window = |range: Range<u64>| -> io::Result<&'a [u8]> {
+            let start = usize::try_from(range.start).map_err(|_| out_of_bounds())?;
+            let end = usize::try_from(range.end).map_err(|_| out_of_bounds())?;
+            data.get(start..end).ok_or_else(out_of_bounds)
+        };
         Ok(Self {
             data,
-            central_directory,
-            entry_count,
-            base_offset,
-            comment,
+            central_directory: window(location.central_directory.clone())?,
+            entry_count: location.entry_count,
+            base_offset: location.base_offset,
+            comment: window(location.comment)?,
         })
     }
 
@@ -209,13 +146,7 @@ impl<'a> ZipSlice<'a> {
     ///
     /// The iterator stops after the first malformed entry, which it yields as an error.
     pub fn entries(&self) -> Entries<'a> {
-        Entries {
-            central_directory: self.central_directory,
-            position: 0,
-            remaining: self.entry_count,
-            base_offset: self.base_offset,
-            failed: false,
-        }
+        Entries::new(self.central_directory, self.entry_count, self.base_offset)
     }
 
     /// Finds the entry for `path` by scanning the central directory.
@@ -486,6 +417,144 @@ impl<'a> ZipSlice<'a> {
     }
 }
 
+/// Where an archive's central directory lies, as found from the records at the end of the
+/// file. Offsets are absolute positions in the file.
+#[derive(Debug, Clone)]
+pub(crate) struct CentralDirectoryLocation {
+    pub(crate) central_directory: Range<u64>,
+    pub(crate) entry_count: u64,
+    /// Length of data prepended to the archive; added to every offset stored in it.
+    pub(crate) base_offset: u64,
+    pub(crate) comment: Range<u64>,
+}
+
+/// Length of the window at the end of a file that holds the end of central directory record
+/// with the longest possible comment, plus the ZIP64 locator and a ZIP64 record before it.
+#[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+pub(crate) const END_RECORDS_WINDOW: u64 =
+    (EOCD_LEN + u16::MAX as usize + ZIP64_LOCATOR_LEN + ZIP64_EOCD_LEN) as u64;
+
+/// Length of a ZIP64 end of central directory record (without extensible data).
+#[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+pub(crate) const ZIP64_RECORD_LEN: usize = ZIP64_EOCD_LEN;
+
+/// If the archive has a ZIP64 locator whose recorded ZIP64 record lies outside `window` (the
+/// last bytes of the file, starting at `window_start`), returns the record's offset so the
+/// caller can fetch those [`ZIP64_RECORD_LEN`] bytes and pass them to
+/// [`locate_central_directory`].
+#[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+pub(crate) fn zip64_record_outside_window(window: &[u8], window_start: u64) -> Option<u64> {
+    let eocd_at = find_eocd(window)?;
+    let locator_at = eocd_at.checked_sub(ZIP64_LOCATOR_LEN)?;
+    let locator = &window[locator_at..eocd_at];
+    if u32_at(locator, 0) != ZIP64_LOCATOR_SIGNATURE {
+        return None;
+    }
+    let record_offset = u64_at(locator, 8);
+    let inside = record_offset >= window_start
+        && record_offset - window_start + ZIP64_EOCD_LEN as u64 <= window.len() as u64;
+    (!inside).then_some(record_offset)
+}
+
+/// Finds the central directory from the last bytes of a file.
+///
+/// `window` holds the file's bytes from `window_start` to the end of the file; for an archive
+/// in memory that is the whole archive and `window_start` is 0. `zip64_record` supplies a
+/// ZIP64 record read from outside the window (see [`zip64_record_outside_window`]), as
+/// `(offset, bytes)`.
+///
+/// Fails with [`ErrorKind::InvalidData`] if the end records are missing or inconsistent, and
+/// with [`ErrorKind::Unsupported`] for multi-disk archives.
+pub(crate) fn locate_central_directory(
+    window: &[u8],
+    window_start: u64,
+    zip64_record: Option<(u64, &[u8])>,
+) -> io::Result<CentralDirectoryLocation> {
+    let eocd_at =
+        find_eocd(window).ok_or_else(|| invalid("end of central directory record not found"))?;
+    let eocd = &window[eocd_at..eocd_at + EOCD_LEN];
+    let comment_len = u64::from(u16_at(eocd, 20));
+    let eocd_offset = window_start + eocd_at as u64;
+    let comment_start = eocd_offset + EOCD_LEN as u64;
+
+    let mut disk = u32::from(u16_at(eocd, 4));
+    let mut cd_disk = u32::from(u16_at(eocd, 6));
+    let mut entries_on_disk = u64::from(u16_at(eocd, 8));
+    let mut entry_count = u64::from(u16_at(eocd, 10));
+    let mut cd_size = u64::from(u32_at(eocd, 12));
+    let mut cd_offset = u64::from(u32_at(eocd, 16));
+    // The central directory must end where the records after it begin.
+    let mut cd_end = eocd_offset;
+
+    if let Some(locator_at) = eocd_at.checked_sub(ZIP64_LOCATOR_LEN) {
+        let locator = &window[locator_at..eocd_at];
+        if u32_at(locator, 0) == ZIP64_LOCATOR_SIGNATURE {
+            if u32_at(locator, 4) != 0 || u32_at(locator, 16) > 1 {
+                return Err(multi_disk());
+            }
+            let record_offset = u64_at(locator, 8);
+            let locator_offset = window_start + locator_at as u64;
+            // A record at an absolute offset, from the window or as supplied by the caller.
+            let record_at = |offset: u64| -> Option<&[u8]> {
+                if let Some((supplied_at, bytes)) = zip64_record {
+                    if supplied_at == offset {
+                        return bytes.get(..ZIP64_EOCD_LEN);
+                    }
+                }
+                let at = usize::try_from(offset.checked_sub(window_start)?).ok()?;
+                slice(window, at, ZIP64_EOCD_LEN)
+            };
+            // With prepended data the stored offset is short by the prefix length. A v1
+            // record without extensible data sits right before the locator, so fall back
+            // to that position when the stored offset does not point at a record.
+            let candidates = [
+                Some(record_offset),
+                locator_offset.checked_sub(ZIP64_EOCD_LEN as u64),
+            ];
+            let (found_at, record) = candidates
+                .into_iter()
+                .flatten()
+                .find_map(|offset| {
+                    record_at(offset)
+                        .filter(|record| u32_at(record, 0) == ZIP64_EOCD_SIGNATURE)
+                        .map(|record| (offset, record))
+                })
+                .ok_or_else(|| invalid("ZIP64 end of central directory record not found"))?;
+            disk = u32_at(record, 16);
+            cd_disk = u32_at(record, 20);
+            entries_on_disk = u64_at(record, 24);
+            entry_count = u64_at(record, 32);
+            cd_size = u64_at(record, 40);
+            cd_offset = u64_at(record, 48);
+            cd_end = found_at;
+        }
+    }
+
+    if disk != 0 || cd_disk != 0 || entries_on_disk != entry_count {
+        return Err(multi_disk());
+    }
+
+    let stored_end = cd_offset
+        .checked_add(cd_size)
+        .ok_or_else(|| invalid("central directory size overflows"))?;
+    if stored_end > cd_end {
+        return Err(invalid("central directory overlaps its end record"));
+    }
+    if entry_count > (cd_size / CENTRAL_HEADER_LEN as u64) {
+        return Err(invalid(
+            "entry count does not fit in the central directory size",
+        ));
+    }
+    let base_offset = cd_end - stored_end;
+    let cd_start = cd_offset + base_offset;
+    Ok(CentralDirectoryLocation {
+        central_directory: cd_start..cd_end,
+        entry_count,
+        base_offset,
+        comment: comment_start..comment_start + comment_len,
+    })
+}
+
 /// Iterator over the central directory; see [`ZipSlice::entries`].
 #[derive(Debug, Clone)]
 pub struct Entries<'a> {
@@ -494,6 +563,19 @@ pub struct Entries<'a> {
     remaining: u64,
     base_offset: u64,
     failed: bool,
+}
+
+impl<'a> Entries<'a> {
+    /// Iterates over `entry_count` headers in a central directory held in memory.
+    pub(crate) fn new(central_directory: &'a [u8], entry_count: u64, base_offset: u64) -> Self {
+        Self {
+            central_directory,
+            position: 0,
+            remaining: entry_count,
+            base_offset,
+            failed: false,
+        }
+    }
 }
 
 impl<'a> Iterator for Entries<'a> {
