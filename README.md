@@ -1,4 +1,4 @@
-[<img alt="github" src="https://img.shields.io/badge/github-vivekpanyam/zipfs-8da0cb?style=for-the-badge&logo=github" height="20">](https://github.com/vivekpanyam/zipfs)
+[<img alt="github" src="https://img.shields.io/badge/github-sunsided/zipfs-8da0cb?style=for-the-badge&logo=github" height="20">](https://github.com/sunsided/zipfs)
 [<img alt="crates.io" src="https://img.shields.io/crates/v/zipfs.svg?style=for-the-badge&logo=rust" height="20">](https://crates.io/crates/zipfs)
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-zipfs-66c2a5?style=for-the-badge&logo=docs.rs" height="20">](https://docs.rs/zipfs)
 

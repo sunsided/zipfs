@@ -6,7 +6,7 @@ rust-version = "1.87"
 authors = ["Vivek Panyam <hello@vivekpanyam.com>"]
 description = "Read zip archives in memory without copying stored files, or on demand from an async source; optional async Lunchbox filesystem."
 license = "Apache-2.0"
-repository = "https://github.com/vivekpanyam/ZipFS"
+repository = "https://github.com/sunsided/zipfs"
 keywords = ["filesystem", "vfs", "async", "zip", "lunchbox"]
 categories = ["filesystem", "asynchronous", "compression"]
 
