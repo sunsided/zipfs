@@ -851,6 +851,7 @@ version = "0.0.2"
 dependencies = [
  "async-trait",
  "async_zip",
+ "crc32fast",
  "lunchbox",
  "miniz_oxide 0.8.9",
  "pin-project",

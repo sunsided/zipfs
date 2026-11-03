@@ -646,6 +646,83 @@ fn truncated_deflate_streams_are_rejected() {
     assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
 }
 
+/// Declared sizes beyond Deflate's maximum ratio are not allocated up front; they take the
+/// streaming path, which still reports the truncation.
+#[cfg(feature = "deflate")]
+#[test]
+fn implausible_declared_sizes_use_the_streaming_path() {
+    let payload = b"short";
+    let deflated: &'static [u8] = deflate_stored_block(payload, true).leak();
+    let mut entry = Hand::file(b"huge", deflated);
+    entry.method = 8;
+    entry.crc = Some(crc32(payload));
+    // 1 GiB from a 10-byte stream: far beyond any possible deflate expansion.
+    entry.uncompressed_size = Some(1 << 30);
+    let bytes = build(&[entry], b"");
+
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    let err = zip.read("huge").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
+}
+
+/// With one-shot decompression limited or off, `read` streams and returns the same bytes, and
+/// still reports corrupt and truncated data the same way.
+#[test]
+fn one_shot_limit_selects_the_streaming_path() {
+    let text = b"compressible text ".repeat(5_000);
+    let mut methods = supported_methods();
+    methods.retain(|method| *method != CompressionMethod::Stored);
+    let bytes = write_zip(|w| {
+        for (i, method) in methods.iter().enumerate() {
+            w.start_file(format!("{i}.txt"), options(*method)).unwrap();
+            w.write_all(&text).unwrap();
+        }
+    });
+
+    let default = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(default.one_shot_limit(), u64::MAX);
+    for limit in [0, 1024, text.len() as u64, u64::MAX] {
+        let zip = ZipArchive::new(&bytes[..])
+            .unwrap()
+            .with_one_shot_limit(limit);
+        assert_eq!(zip.one_shot_limit(), limit);
+        for i in 0..methods.len() {
+            let path = format!("{i}.txt");
+            assert_eq!(
+                &*zip.read(&path).unwrap(),
+                &text[..],
+                "{path} with limit {limit}"
+            );
+        }
+    }
+
+    #[cfg(feature = "deflate")]
+    {
+        let payload = b"complete output, missing final block";
+        let truncated: &'static [u8] = deflate_stored_block(payload, false).leak();
+        let mut entry = Hand::file(b"truncated", truncated);
+        entry.method = 8;
+        entry.crc = Some(crc32(payload));
+        entry.uncompressed_size = Some(payload.len() as u32);
+        let bytes = build(&[entry], b"");
+        for limit in [0, u64::MAX] {
+            let zip = ZipArchive::new(&bytes[..])
+                .unwrap()
+                .with_one_shot_limit(limit);
+            assert_eq!(
+                zip.read("truncated").unwrap_err().kind(),
+                ErrorKind::UnexpectedEof,
+                "limit {limit}"
+            );
+        }
+        let zip = ZipArchive::new(SIZE_BOMB).unwrap().with_one_shot_limit(0);
+        assert_eq!(
+            zip.read("bomb.bin").unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+    }
+}
+
 #[test]
 fn encrypted_entries_are_rejected() {
     let mut entry = Hand::file(b"secret.txt", b"x");
