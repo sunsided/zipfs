@@ -577,8 +577,12 @@ pub(crate) fn data_range(
     }
     let name_len = usize::from(u16_at(header, 26));
     let extra_len = usize::from(u16_at(header, 28));
-    let start = header_at + LOCAL_HEADER_LEN + name_len + extra_len;
     let len = usize::try_from(compressed_size).map_err(|_| out_of_bounds())?;
+    let start = header_at
+        .checked_add(LOCAL_HEADER_LEN)
+        .and_then(|at| at.checked_add(name_len))
+        .and_then(|at| at.checked_add(extra_len))
+        .ok_or_else(out_of_bounds)?;
     let end = start.checked_add(len).ok_or_else(out_of_bounds)?;
     if end > data.len() {
         return Err(out_of_bounds());
