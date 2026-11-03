@@ -21,7 +21,7 @@
 //! # }
 //! ```
 
-use std::io::{self, SeekFrom};
+use std::io::{self, Read, SeekFrom};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
@@ -37,7 +37,7 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 use crate::archive::{FileLocation, Metadata, ZipArchive};
 use crate::format::{EntryKind, Method};
-use crate::reader;
+use crate::reader::{Decoding, OwnedSource};
 
 /// A read-only [`lunchbox`] filesystem over a zip archive held in memory.
 ///
@@ -46,7 +46,8 @@ use crate::reader;
 /// `bytes::Bytes`. [`ZipFS::from_file`] reads an archive file into an `Arc<[u8]>`.
 ///
 /// Reads never wait: stored files are copied straight out of the archive bytes, and compressed
-/// files are decompressed on the calling task when first read. As with [`ZipArchive::read`],
+/// files are decompressed incrementally on the calling task, so memory per open file stays at
+/// the decoder's working set rather than the file size. As with [`ZipArchive::read`],
 /// stored files are not checked against their CRC-32 (that would mean scanning them on open);
 /// decompressed files always are. Use [`ZipArchive::open`] via [`ZipFS::archive`] for a
 /// verified streaming read of a stored file.
@@ -95,19 +96,26 @@ impl ZipFS<Arc<[u8]>> {
 
 /// A file opened from a [`ZipFS`].
 ///
-/// Clones made with [`ReadableFile::try_clone`] share the read position, like duplicated file
-/// handles. The file also implements [`AsyncSeek`].
-pub struct File<D> {
+/// Clones made with [`ReadableFile::try_clone`] share the read position (and decoder), like
+/// duplicated file handles. The file also implements [`AsyncSeek`]; in a compressed file,
+/// seeking forward decodes and discards the skipped data, and seeking backward restarts
+/// decoding from the beginning.
+pub struct File<D: AsRef<[u8]>> {
     data: D,
     location: FileLocation,
-    state: Arc<Mutex<FileState>>,
+    state: Arc<Mutex<FileState<D>>>,
 }
 
-#[derive(Default)]
-struct FileState {
+struct FileState<D: AsRef<[u8]>> {
     position: u64,
-    /// Decompressed contents, produced on first read; `None` for stored files.
-    decompressed: Option<Vec<u8>>,
+    /// Decoder for compressed files, created on first read; never used for stored files.
+    stream: Option<Stream<D>>,
+}
+
+struct Stream<D: AsRef<[u8]>> {
+    decoding: Decoding<OwnedSource<D>>,
+    /// Uncompressed bytes produced so far.
+    offset: u64,
 }
 
 impl<D: AsRef<[u8]>> File<D> {
@@ -115,50 +123,80 @@ impl<D: AsRef<[u8]>> File<D> {
         Self {
             data,
             location,
-            state: Arc::new(Mutex::new(FileState::default())),
+            state: Arc::new(Mutex::new(FileState {
+                position: 0,
+                stream: None,
+            })),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, FileState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FileState<D>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-impl<D: AsRef<[u8]> + Unpin> AsyncRead for File<D> {
+impl<D: AsRef<[u8]> + Clone> File<D> {
+    /// Reads at the shared position into `out`, decoding compressed files incrementally.
+    fn read_at_position(&self, out: &mut [u8]) -> io::Result<usize> {
+        let location = &self.location;
+        let mut state = self.lock();
+        let FileState { position, stream } = &mut *state;
+
+        if location.method == Method::Stored {
+            let contents = &self.data.as_ref()[location.range.clone()];
+            let start = usize::try_from(*position)
+                .unwrap_or(usize::MAX)
+                .min(contents.len());
+            let len = out.len().min(contents.len() - start);
+            out[..len].copy_from_slice(&contents[start..start + len]);
+            *position = (start + len) as u64;
+            return Ok(len);
+        }
+
+        // A backward seek restarts decoding; the first read starts it.
+        if stream
+            .as_ref()
+            .is_none_or(|stream| stream.offset > *position)
+        {
+            *stream = Some(Stream {
+                decoding: Decoding::new(
+                    OwnedSource::new(self.data.clone(), location.range.clone()),
+                    location.method,
+                    location.uncompressed_size,
+                    location.crc32,
+                )?,
+                offset: 0,
+            });
+        }
+        let stream = stream.as_mut().expect("created above");
+
+        // A forward seek decodes and discards the skipped bytes.
+        let mut scratch = [0u8; 8 * 1024];
+        while stream.offset < *position {
+            let skip = (*position - stream.offset).min(scratch.len() as u64) as usize;
+            let skipped = stream.decoding.read(&mut scratch[..skip])?;
+            if skipped == 0 {
+                // Positioned past the end of the file.
+                return Ok(0);
+            }
+            stream.offset += skipped as u64;
+        }
+
+        let read = stream.decoding.read(out)?;
+        stream.offset += read as u64;
+        *position = stream.offset;
+        Ok(read)
+    }
+}
+
+impl<D: AsRef<[u8]> + Clone + Unpin> AsyncRead for File<D> {
     fn poll_read(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let raw = &this.data.as_ref()[this.location.range.clone()];
-        let mut state = this.lock();
-
-        if this.location.method != Method::Stored && state.decompressed.is_none() {
-            match reader::decompress(
-                raw,
-                this.location.method,
-                this.location.uncompressed_size,
-                this.location.crc32,
-                u64::MAX,
-            ) {
-                Ok(contents) => state.decompressed = Some(contents),
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-        }
-
-        let FileState {
-            position,
-            decompressed,
-        } = &mut *state;
-        let contents: &[u8] = decompressed.as_deref().unwrap_or(raw);
-        let start = usize::try_from(*position)
-            .unwrap_or(usize::MAX)
-            .min(contents.len());
-        let len = buf.remaining().min(contents.len() - start);
-        buf.put_slice(&contents[start..start + len]);
-        *position = (start + len) as u64;
-        Poll::Ready(Ok(()))
+        let read = self.read_at_position(buf.initialize_unfilled());
+        Poll::Ready(read.map(|count| buf.advance(count)))
     }
 }
 
@@ -204,7 +242,7 @@ where
     }
 }
 
-impl<D> HasFileType for ZipFS<D> {
+impl<D: AsRef<[u8]>> HasFileType for ZipFS<D> {
     type FileType = File<D>;
 }
 

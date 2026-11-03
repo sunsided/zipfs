@@ -1,9 +1,67 @@
 //! Streaming reader for the contents of one archive entry.
 
 use std::io::{self, ErrorKind, Read};
+use std::ops::Range;
 
 use crate::crc32::Crc32;
 use crate::format::Method;
+
+/// Compressed (or stored) input for a [`Decoding`]: the bytes not yet consumed.
+///
+/// Implemented for borrowed slices, used by [`EntryReader`], and for [`OwnedSource`], which
+/// keeps its own handle to the archive data so a decoder can live as long as a `ZipFS` file.
+pub(crate) trait Source {
+    fn remaining(&self) -> &[u8];
+    fn consume(&mut self, count: usize);
+}
+
+impl Source for &[u8] {
+    fn remaining(&self) -> &[u8] {
+        self
+    }
+
+    fn consume(&mut self, count: usize) {
+        *self = &self[count..];
+    }
+}
+
+/// Input that owns a handle to the archive bytes, plus the range still to be read.
+#[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+pub(crate) struct OwnedSource<D> {
+    data: D,
+    range: Range<usize>,
+}
+
+#[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+impl<D: AsRef<[u8]>> OwnedSource<D> {
+    /// `range` must lie within `data`.
+    pub(crate) fn new(data: D, range: Range<usize>) -> Self {
+        Self { data, range }
+    }
+}
+
+impl<D: AsRef<[u8]>> Source for OwnedSource<D> {
+    fn remaining(&self) -> &[u8] {
+        &self.data.as_ref()[self.range.clone()]
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.range.start += count;
+    }
+}
+
+/// Adapts a [`Source`] to [`Read`], for decoders that pull their input.
+struct SourceReader<S>(S);
+
+impl<S: Source> Read for SourceReader<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.0.remaining();
+        let count = remaining.len().min(buf.len());
+        buf[..count].copy_from_slice(&remaining[..count]);
+        self.0.consume(count);
+        Ok(count)
+    }
+}
 
 /// Reads (and decompresses) one entry, checking its size and CRC-32.
 ///
@@ -11,8 +69,32 @@ use crate::format::Method;
 /// would produce more fails with [`ErrorKind::InvalidData`] as soon as it does, so a small,
 /// highly compressed entry with a forged size cannot expand without bound. At the end of the
 /// stream the total size and the CRC-32 are verified.
-pub struct EntryReader<'a> {
-    decoder: Decoder<'a>,
+pub struct EntryReader<'a>(Decoding<&'a [u8]>);
+
+impl<'a> EntryReader<'a> {
+    /// Creates a reader over an entry's raw data.
+    pub(crate) fn new(
+        raw: &'a [u8],
+        method: Method,
+        uncompressed_size: u64,
+        crc32: u32,
+    ) -> io::Result<Self> {
+        Decoding::new(raw, method, uncompressed_size, crc32).map(Self)
+    }
+}
+
+impl Read for EntryReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+/// Incremental decoding of one entry from a [`Source`], with the checks of [`EntryReader`].
+///
+/// Memory stays bounded by the decoder's working set (the Deflate window, or the Zstandard
+/// window as far as output has been produced), not by the size of the entry.
+pub(crate) struct Decoding<S: Source> {
+    decoder: Decoder<S>,
     /// Declared uncompressed bytes not yet returned.
     remaining: u64,
     crc: Crc32,
@@ -27,43 +109,42 @@ enum State {
     Failed,
 }
 
-enum Decoder<'a> {
-    Stored(&'a [u8]),
+enum Decoder<S: Source> {
+    Stored(SourceReader<S>),
     #[cfg(feature = "deflate")]
     Deflate {
         state: Box<miniz_oxide::inflate::stream::InflateState>,
-        input: &'a [u8],
+        input: S,
     },
     #[cfg(feature = "zstd")]
-    Zstd(Box<ruzstd::decoding::StreamingDecoder<&'a [u8], ruzstd::decoding::FrameDecoder>>),
+    Zstd(Box<ruzstd::decoding::StreamingDecoder<SourceReader<S>, ruzstd::decoding::FrameDecoder>>),
 }
 
-impl<'a> EntryReader<'a> {
-    /// Creates a reader over an entry's raw data.
+impl<S: Source> Decoding<S> {
     pub(crate) fn new(
-        raw: &'a [u8],
+        input: S,
         method: Method,
         uncompressed_size: u64,
         crc32: u32,
     ) -> io::Result<Self> {
         let decoder = match method {
-            Method::Stored => Decoder::Stored(raw),
+            Method::Stored => Decoder::Stored(SourceReader(input)),
             #[cfg(feature = "deflate")]
             Method::Deflate => Decoder::Deflate {
                 state: miniz_oxide::inflate::stream::InflateState::new_boxed(
                     miniz_oxide::DataFormat::Raw,
                 ),
-                input: raw,
+                input,
             },
             // ruzstd rejects frames whose window exceeds 128 MiB and grows its ring buffer as
-            // output is produced rather than allocating the window up front. Because `read`
-            // asks for at most the declared size plus one byte, decoder memory stays within
-            // the declared size plus one block (128 KiB). The window is not capped at the
-            // entry size: streaming encoders use the level's default window (2-8 MiB) even for
-            // small files.
+            // output is produced rather than allocating the window up front. Its streaming
+            // decoder decodes only as far as the bytes requested, and `read` asks for at most
+            // the declared size plus one byte, so decoder memory stays within the declared size
+            // plus one block (128 KiB). The window is not capped at the entry size: streaming
+            // encoders use the level's default window (2-8 MiB) even for small files.
             #[cfg(feature = "zstd")]
             Method::Zstd => Decoder::Zstd(Box::new(
-                ruzstd::decoding::StreamingDecoder::new(raw).map_err(|err| {
+                ruzstd::decoding::StreamingDecoder::new(SourceReader(input)).map_err(|err| {
                     io::Error::new(ErrorKind::InvalidData, format!("invalid zstd data: {err}"))
                 })?,
             )),
@@ -84,7 +165,7 @@ impl<'a> EntryReader<'a> {
     }
 }
 
-impl Read for EntryReader<'_> {
+impl<S: Source> Read for Decoding<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.state {
             State::Done => return Ok(0),
@@ -157,23 +238,24 @@ impl Read for EntryReader<'_> {
 /// progress on is [`ErrorKind::InvalidData`], so a truncated stream is never mistaken for a
 /// complete one even if it already produced the declared number of bytes.
 #[cfg(feature = "deflate")]
-fn inflate(
+fn inflate<S: Source>(
     state: &mut miniz_oxide::inflate::stream::InflateState,
-    input: &mut &[u8],
+    input: &mut S,
     out: &mut [u8],
 ) -> io::Result<usize> {
     use miniz_oxide::{MZError, MZFlush, MZStatus};
 
     loop {
-        let result = miniz_oxide::inflate::stream::inflate(state, input, out, MZFlush::None);
-        *input = &input[result.bytes_consumed..];
+        let result =
+            miniz_oxide::inflate::stream::inflate(state, input.remaining(), out, MZFlush::None);
+        input.consume(result.bytes_consumed);
         if result.bytes_written > 0 {
             return Ok(result.bytes_written);
         }
         match result.status {
             Ok(MZStatus::StreamEnd) => return Ok(0),
             Ok(_) | Err(MZError::Buf) if result.bytes_consumed > 0 => {}
-            Ok(_) | Err(MZError::Buf) if input.is_empty() => {
+            Ok(_) | Err(MZError::Buf) if input.remaining().is_empty() => {
                 return Err(io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "deflate stream is truncated",
