@@ -251,7 +251,8 @@ pub(crate) fn decompress_to_vec(
         }
         #[cfg(feature = "zstd")]
         Method::Zstd => ruzstd::decoding::FrameDecoder::new()
-            .decode_all(raw, &mut out)
+            // `decode_all` fills the fixed-size slice in place; it cannot grow the buffer.
+            .decode_all(raw, out.as_mut_slice())
             .map_err(|err| {
                 io::Error::new(ErrorKind::InvalidData, format!("invalid zstd data: {err}"))
             })?,
