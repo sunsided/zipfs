@@ -27,7 +27,7 @@ env:
 
 jobs:
   fuzz:
-    name: Fuzz ${{ matrix.target }}
+    name: Fuzz ${{ matrix.target }}${{ matrix.features && format(' ({0})', matrix.features) || '' }}
     runs-on: ubuntu-latest
     # Covers the longest allowed run (3 hours) plus building cargo-fuzz and the targets.
     timeout-minutes: 210
@@ -38,6 +38,14 @@ jobs:
           - archive
           - slice
           - decompress
+        features:
+          - ""
+        include:
+          # Path resolution with symlinks followed in every component.
+          - target: archive
+            features: full-symlinks
+          - target: slice
+            features: full-symlinks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,6 +64,7 @@ jobs:
       - name: cargo fuzz run
         env:
           TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
           EVENT: ${{ github.event_name }}
           REQUESTED_SECONDS: ${{ github.event.inputs.seconds }}
         run: |
@@ -80,14 +89,18 @@ jobs:
             inputs=(fuzz/seeds)
             options=(-dict=fuzz/zip.dict)
           fi
+          features=()
+          if [ -n "$FEATURES" ]; then
+            features=(--features "$FEATURES")
+          fi
           mkdir -p "fuzz/corpus/$TARGET"
-          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "${inputs[@]}" -- \
+          cargo fuzz run "${features[@]}" "$TARGET" "fuzz/corpus/$TARGET" "${inputs[@]}" -- \
             "${options[@]}" -max_total_time="$seconds" -timeout=10 -rss_limit_mb=2048
       - name: Upload crash inputs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
+          name: fuzz-artifacts-${{ matrix.target }}${{ matrix.features && format('-{0}', matrix.features) || '' }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14

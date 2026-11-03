@@ -227,6 +227,11 @@ impl<'a> ZipSlice<'a> {
         let Some(key) = normalize(path) else {
             return Ok(None);
         };
+        // The archive root is always a directory; entries for it (`/`, `./`) are ignored, as
+        // in `ZipArchive`.
+        if key.is_empty() {
+            return Ok(None);
+        }
         let mut found = None;
         for entry in self.entries() {
             let entry = entry?;
@@ -262,6 +267,15 @@ impl<'a> ZipSlice<'a> {
     /// `String`. Targets are limited to 4 KiB, may not be absolute or leave the archive root,
     /// and at most 40 links are followed.
     pub fn resolve<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
+        #[cfg(feature = "full-symlinks")]
+        return self.resolve_walk(path);
+        #[cfg(not(feature = "full-symlinks"))]
+        self.resolve_lexical(path)
+    }
+
+    /// Follows symlinks in the final path component, joining targets lexically.
+    #[cfg(not(feature = "full-symlinks"))]
+    fn resolve_lexical<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
         let mut current = normalize(path).ok_or_else(|| not_found(path))?;
         for _ in 0..paths::MAX_SYMLINK_HOPS {
             let entry = match self.find(&current)? {
@@ -284,8 +298,33 @@ impl<'a> ZipSlice<'a> {
         Err(paths::too_many_links())
     }
 
+    /// Follows symlinks in every path component (`full-symlinks`).
+    #[cfg(feature = "full-symlinks")]
+    fn resolve_walk<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
+        let symlinks = self.symlinks()?;
+        let resolved =
+            paths::resolve_walk(path, true, false, |p| self.symlink_target_in(&symlinks, p))?;
+        let entry = match self.find(&resolved)? {
+            Some(entry) => entry,
+            None if self.has_children(&resolved)? => {
+                return Err(io::Error::new(
+                    ErrorKind::IsADirectory,
+                    format!("is a directory: {resolved}"),
+                ));
+            }
+            None => return Err(not_found(&resolved)),
+        };
+        Ok((Cow::Owned(resolved), entry))
+    }
+
     /// Returns the target of the symlink at `path` as a normalized path from the archive root.
     pub fn read_link(&self, path: &str) -> io::Result<String> {
+        #[cfg(feature = "full-symlinks")]
+        let symlinks = self.symlinks()?;
+        #[cfg(feature = "full-symlinks")]
+        let link_path =
+            paths::resolve_walk(path, false, false, |p| self.symlink_target_in(&symlinks, p))?;
+        #[cfg(not(feature = "full-symlinks"))]
         let link_path = normalize(path).ok_or_else(|| not_found(path))?;
         let entry = self
             .find(&link_path)?
@@ -295,7 +334,62 @@ impl<'a> ZipSlice<'a> {
         }
         let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];
         let target = self.link_target(&link_path, &entry, &mut buffer)?;
+        #[cfg(feature = "full-symlinks")]
+        {
+            let target = paths::check_link_target(target)?.replace('\\', "/");
+            let joined = format!("{}/{target}", paths::parent(&link_path));
+            paths::resolve_walk(&joined, false, true, |p| {
+                self.symlink_target_in(&symlinks, p)
+            })
+        }
+        #[cfg(not(feature = "full-symlinks"))]
         paths::resolve_link(&link_path, target)
+    }
+
+    /// The symlinks of the archive by normalized path, as `find` would see them (the last
+    /// entry with a path wins, so a later non-symlink entry hides an earlier symlink).
+    ///
+    /// Collected in one pass per resolution so that each path component is a map lookup
+    /// instead of another scan of the central directory; archives without symlinks allocate
+    /// nothing for it.
+    #[cfg(feature = "full-symlinks")]
+    fn symlinks(&self) -> io::Result<std::collections::HashMap<String, Entry<'a>>> {
+        let mut symlinks = std::collections::HashMap::new();
+        for entry in self.entries() {
+            let entry = entry?;
+            let is_symlink = entry.kind() == EntryKind::Symlink;
+            // Only symlinks, and names that might shadow one, are looked at further, so
+            // archives without symlinks allocate nothing here.
+            if !is_symlink && symlinks.is_empty() {
+                continue;
+            }
+            let raw_name = entry.name()?;
+            let Some(name) = paths::normalize_entry_name(&raw_name) else {
+                continue;
+            };
+            if is_symlink && !name.is_empty() {
+                symlinks.insert(name.into_owned(), entry);
+            } else {
+                symlinks.remove(name.as_ref());
+            }
+        }
+        Ok(symlinks)
+    }
+
+    /// Looks a normalized path up in [`symlinks`](Self::symlinks) and reads its target.
+    #[cfg(feature = "full-symlinks")]
+    fn symlink_target_in(
+        &self,
+        symlinks: &std::collections::HashMap<String, Entry<'a>>,
+        normalized: &str,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some(entry) = symlinks.get(normalized) else {
+            return Ok(None);
+        };
+        let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];
+        Ok(Some(
+            self.link_target(normalized, entry, &mut buffer)?.to_vec(),
+        ))
     }
 
     /// Whether any entry lies below the normalized directory path `dir`, which makes `dir` a

@@ -38,6 +38,10 @@ pub struct ZipArchive<D> {
     sorted: Vec<usize>,
     /// Normalized paths of all entries, concatenated; `IndexedEntry::name` indexes into it.
     names: String,
+    /// Whether any entry is a symlink; with `full-symlinks`, paths are only walked component
+    /// by component when there is something to follow.
+    #[cfg(feature = "full-symlinks")]
+    has_symlinks: bool,
     /// Largest uncompressed size that `read` decompresses in one call; see
     /// [`ZipArchive::with_one_shot_limit`].
     one_shot_limit: u64,
@@ -164,10 +168,14 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
             }
         }
 
+        #[cfg(feature = "full-symlinks")]
+        let has_symlinks = entries.iter().any(|entry| entry.kind == EntryKind::Symlink);
         Ok(Self {
             data,
             entries,
             sorted: deduplicated,
+            #[cfg(feature = "full-symlinks")]
+            has_symlinks,
             names,
             one_shot_limit: u64::MAX,
             verify_stored: false,
@@ -311,16 +319,24 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
 
     /// Returns metadata without following a symlink in the final path component.
     pub fn symlink_metadata(&self, path: &str) -> io::Result<Metadata> {
-        let path = normalize(path).ok_or_else(|| not_found(path))?;
+        let path = self.resolve_parent(path)?;
         self.metadata_for(&path, self.find(&path))
     }
 
     /// Returns the target of a symlink as a normalized path from the archive root.
     pub fn read_link(&self, path: &str) -> io::Result<String> {
-        let path = normalize(path).ok_or_else(|| not_found(path))?;
+        let path = self.resolve_parent(path)?;
         let entry = self.find(&path).ok_or_else(|| not_found(&path))?;
         if entry.kind != EntryKind::Symlink {
             return Err(io::Error::new(ErrorKind::InvalidInput, "not a symlink"));
+        }
+        #[cfg(feature = "full-symlinks")]
+        if self.has_symlinks {
+            paths::check_link_target_size(&path, entry.uncompressed_size)?;
+            let target = self.entry_bytes(entry)?;
+            let target = paths::check_link_target(&target)?.replace('\\', "/");
+            let joined = format!("{}/{target}", paths::parent(&path));
+            return paths::resolve_walk(&joined, false, true, |p| self.symlink_target_bytes(p));
         }
         self.link_target(&path, entry)
     }
@@ -338,6 +354,13 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     /// The path stays borrowed unless normalization or a symlink changed it, so lookups of
     /// plain paths do not allocate.
     fn resolve<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Option<&IndexedEntry>)> {
+        #[cfg(feature = "full-symlinks")]
+        if self.has_symlinks {
+            let resolved =
+                paths::resolve_walk(path, true, false, |p| self.symlink_target_bytes(p))?;
+            let entry = self.find(&resolved);
+            return Ok((Cow::Owned(resolved), entry));
+        }
         let mut current = normalize(path).ok_or_else(|| not_found(path))?;
         for _ in 0..paths::MAX_SYMLINK_HOPS {
             match self.find(&current) {
@@ -476,6 +499,29 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     }
 
     /// Reads a symlink entry's target and resolves it relative to the link's directory.
+    /// Normalizes `path` and, with `full-symlinks`, follows symlinks in every component but the
+    /// last; for operations on a symlink itself (`symlink_metadata`, `read_link`).
+    fn resolve_parent<'p>(&self, path: &'p str) -> io::Result<Cow<'p, str>> {
+        #[cfg(feature = "full-symlinks")]
+        if self.has_symlinks {
+            return paths::resolve_walk(path, false, false, |p| self.symlink_target_bytes(p))
+                .map(Cow::Owned);
+        }
+        normalize(path).ok_or_else(|| not_found(path))
+    }
+
+    /// The raw target of the entry at a normalized path, if it is a symlink.
+    #[cfg(feature = "full-symlinks")]
+    fn symlink_target_bytes(&self, normalized: &str) -> io::Result<Option<Vec<u8>>> {
+        match self.find(normalized) {
+            Some(entry) if entry.kind == EntryKind::Symlink => {
+                paths::check_link_target_size(normalized, entry.uncompressed_size)?;
+                Ok(Some(self.entry_bytes(entry)?.into_owned()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn link_target(&self, link_path: &str, entry: &IndexedEntry) -> io::Result<String> {
         // The declared size bounds the bytes actually read: `EntryReader` fails on any output
         // beyond it, and stored slices are exactly the declared size.

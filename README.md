@@ -79,6 +79,7 @@ async fn load(assets: &'static [u8]) -> std::io::Result<()> {
 | `deflate`   | yes     | Reading Deflate entries (what most zip tools produce), via `miniz_oxide` |
 | `zstd`      | yes     | Reading Zstandard entries, via the pure-Rust `ruzstd`                |
 | `crc32fast` | yes     | Hardware-accelerated CRC-32 via `crc32fast`; otherwise a built-in implementation is used |
+| `full-symlinks` | no  | Follow symlinks in every path component (`linked_dir/file.png`), resolving `..` after links as POSIX does (entries stored below a symlinked directory are then shadowed by the link); by default only the last component is followed |
 | `lunchbox`  | no      | `ZipFS`, an async Lunchbox filesystem (adds `lunchbox`, `async-trait` and `tokio`) |
 
 Everything is pure Rust and builds for WebAssembly, including `wasm32-wasip1`.
