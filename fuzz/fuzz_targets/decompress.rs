@@ -43,10 +43,15 @@ struct Input {
 /// Bound the declared size so iterations stay fast.
 const MAX_DECLARED: u32 = 1 << 20;
 
+/// Bound the entry data independently of libFuzzer's `-max_len`, so sizes and offsets in the
+/// generated archive always fit their 32-bit fields and iterations stay fast.
+const MAX_DATA: usize = 64 * 1024;
+
 fuzz_target!(|input: Input| {
     let declared = input.declared_size % MAX_DECLARED;
     let mode = if input.symlink { 0o120_777 } else { 0o100_644 };
-    let bytes = single_entry_zip(input.method.id(), input.crc32, &input.data, declared, mode);
+    let data = &input.data[..input.data.len().min(MAX_DATA)];
+    let bytes = single_entry_zip(input.method.id(), input.crc32, data, declared, mode);
 
     let Ok(zip) = ZipArchive::new(&bytes[..]) else {
         return;
