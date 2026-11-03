@@ -35,7 +35,8 @@ const ZIP64_EOCD_LEN: usize = 56;
 const CENTRAL_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const CENTRAL_HEADER_LEN: usize = 46;
 const LOCAL_HEADER_SIGNATURE: u32 = 0x0403_4b50;
-const LOCAL_HEADER_LEN: usize = 30;
+/// Length of a local file header without its name and extra field.
+pub(crate) const LOCAL_HEADER_LEN: usize = 30;
 
 const EXTRA_ZIP64: u16 = 0x0001;
 const EXTRA_EXTENDED_TIMESTAMP: u16 = 0x5455;
@@ -758,28 +759,50 @@ pub(crate) fn data_range(
     method: Method,
     uncompressed_size: u64,
 ) -> io::Result<Range<usize>> {
+    let header_at = usize::try_from(local_header_offset).map_err(|_| out_of_bounds())?;
+    let header = slice(data, header_at, LOCAL_HEADER_LEN).ok_or_else(out_of_bounds)?;
+    let range = local_data_range(
+        header,
+        local_header_offset,
+        compressed_size,
+        method,
+        uncompressed_size,
+    )?;
+    let start = usize::try_from(range.start).map_err(|_| out_of_bounds())?;
+    let end = usize::try_from(range.end).map_err(|_| out_of_bounds())?;
+    if end > data.len() {
+        return Err(out_of_bounds());
+    }
+    Ok(start..end)
+}
+
+/// Where an entry's data lies, from its local file header (the first [`LOCAL_HEADER_LEN`]
+/// bytes of `header`, read at `local_header_offset`). The range is not checked against the
+/// length of the file.
+pub(crate) fn local_data_range(
+    header: &[u8],
+    local_header_offset: u64,
+    compressed_size: u64,
+    method: Method,
+    uncompressed_size: u64,
+) -> io::Result<Range<u64>> {
     if method == Method::Stored && compressed_size != uncompressed_size {
         return Err(invalid(
             "stored entry has differing compressed and uncompressed sizes",
         ));
     }
-    let header_at = usize::try_from(local_header_offset).map_err(|_| out_of_bounds())?;
-    let header = slice(data, header_at, LOCAL_HEADER_LEN).ok_or_else(out_of_bounds)?;
+    let header = header.get(..LOCAL_HEADER_LEN).ok_or_else(out_of_bounds)?;
     if u32_at(header, 0) != LOCAL_HEADER_SIGNATURE {
         return Err(invalid("local file header signature not found"));
     }
-    let name_len = usize::from(u16_at(header, 26));
-    let extra_len = usize::from(u16_at(header, 28));
-    let len = usize::try_from(compressed_size).map_err(|_| out_of_bounds())?;
-    let start = header_at
-        .checked_add(LOCAL_HEADER_LEN)
-        .and_then(|at| at.checked_add(name_len))
-        .and_then(|at| at.checked_add(extra_len))
+    let name_len = u64::from(u16_at(header, 26));
+    let extra_len = u64::from(u16_at(header, 28));
+    let start = local_header_offset
+        .checked_add(LOCAL_HEADER_LEN as u64 + name_len + extra_len)
         .ok_or_else(out_of_bounds)?;
-    let end = start.checked_add(len).ok_or_else(out_of_bounds)?;
-    if end > data.len() {
-        return Err(out_of_bounds());
-    }
+    let end = start
+        .checked_add(compressed_size)
+        .ok_or_else(out_of_bounds)?;
     Ok(start..end)
 }
 

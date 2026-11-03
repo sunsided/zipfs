@@ -1,8 +1,10 @@
-//! `ZipFS`: a [`lunchbox`] read-only filesystem over a zip archive held in memory.
+//! `ZipFS`: a [`lunchbox`] read-only filesystem over a zip archive, held in memory or read on
+//! demand from an [`AsyncSource`].
 //!
-//! Enabled with the `lunchbox` feature. `ZipFS` is built on [`ZipArchive`]: lookups use its
-//! index, stored files are served straight from the archive bytes, and compressed files are
-//! decompressed (and verified) when first read.
+//! Enabled with the `lunchbox` feature. `ZipFS<D>` is built on [`ZipArchive`]: lookups use
+//! its index, stored files are served straight from the archive bytes, and compressed files
+//! are decompressed (and verified) when first read. `ZipFS<Source<S>>` is built on
+//! [`SourceArchive`] and fetches file contents from the source when they are read.
 //!
 //! ```
 //! # async fn example() -> std::io::Result<()> {
@@ -21,10 +23,13 @@
 //! # }
 //! ```
 
+use std::future::Future;
 use std::io::{self, Read, SeekFrom};
+use std::marker::PhantomData;
+use std::ops::Range;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
 use lunchbox::ReadableFileSystem;
@@ -35,11 +40,47 @@ use lunchbox::types::{
 };
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
-use crate::archive::{FileLocation, Metadata, ZipArchive};
+use crate::archive::{self, FileLocation, Metadata, ZipArchive};
 use crate::format::{EntryKind, Method};
 use crate::reader::{Decoding, OwnedSource};
+use crate::source::{self, AsyncSource, SourceArchive, SourceLocation};
 
-/// A read-only [`lunchbox`] filesystem over a zip archive held in memory.
+/// Where a [`ZipFS`] reads its archive from: the archive bytes `D` in memory, or an
+/// [`AsyncSource`] wrapped in [`Source`].
+///
+/// This trait is sealed; it only names the archive and file types of each backend.
+pub trait Backend: sealed::Sealed {
+    /// The archive a [`ZipFS`] with this backend wraps.
+    type Archive;
+    /// The files a [`ZipFS`] with this backend opens.
+    type File;
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+impl<D: AsRef<[u8]>> sealed::Sealed for D {}
+
+impl<D: AsRef<[u8]>> Backend for D {
+    type Archive = ZipArchive<D>;
+    type File = File<D>;
+}
+
+/// Selects the [`AsyncSource`] backend of [`ZipFS`]: `ZipFS<Source<S>>` reads its archive
+/// from `S` on demand. Never constructed; see [`ZipFS::from_source`].
+pub struct Source<S>(PhantomData<fn() -> S>);
+
+impl<S> sealed::Sealed for Source<S> {}
+
+impl<S: AsyncSource> Backend for Source<S> {
+    type Archive = SourceArchive<S>;
+    type File = SourceFile<S>;
+}
+
+/// A read-only [`lunchbox`] filesystem over a zip archive.
+///
+/// # In memory: `ZipFS<D>`
 ///
 /// `D` holds the archive bytes and must be cheap to clone, since every opened [`File`] keeps
 /// its own handle to them: `&'static [u8]` (e.g. from `include_bytes!`), `Arc<[u8]>` or
@@ -51,8 +92,29 @@ use crate::reader::{Decoding, OwnedSource};
 /// stored files are not checked against their CRC-32 (that would mean scanning them on open);
 /// decompressed files always are. Use [`ZipArchive::open`] via [`ZipFS::archive`] for a
 /// verified streaming read of a stored file.
-pub struct ZipFS<D> {
-    archive: ZipArchive<D>,
+///
+/// # From an async source: `ZipFS<Source<S>>`
+///
+/// [`ZipFS::from_source`] fetches the central directory from an [`AsyncSource`] and keeps
+/// only the index in memory; see [`SourceArchive`]. Opening a file fetches its local header.
+/// Stored files are then fetched in chunks of 64 KiB as they are read (not checked against
+/// their CRC-32, as in memory). A compressed file's compressed bytes are fetched whole on its
+/// first read and decoded incrementally from there, so a large compressed file needs its
+/// compressed size in memory while it is open. [`read`](ReadableFileSystem::read) fetches and
+/// verifies whole files.
+pub struct ZipFS<B: Backend> {
+    archive: B::Archive,
+}
+
+impl<B: Backend> ZipFS<B> {
+    /// The underlying archive, for synchronous lookups.
+    pub fn archive(&self) -> &B::Archive {
+        &self.archive
+    }
+
+    pub fn into_archive(self) -> B::Archive {
+        self.archive
+    }
 }
 
 impl<D: AsRef<[u8]> + Clone> ZipFS<D> {
@@ -66,18 +128,9 @@ impl<D: AsRef<[u8]> + Clone> ZipFS<D> {
             archive: ZipArchive::new(data)?,
         })
     }
-
-    /// The underlying archive, for synchronous access.
-    pub fn archive(&self) -> &ZipArchive<D> {
-        &self.archive
-    }
-
-    pub fn into_archive(self) -> ZipArchive<D> {
-        self.archive
-    }
 }
 
-impl<D> From<ZipArchive<D>> for ZipFS<D> {
+impl<D: AsRef<[u8]>> From<ZipArchive<D>> for ZipFS<D> {
     fn from(archive: ZipArchive<D>) -> Self {
         Self { archive }
     }
@@ -87,14 +140,41 @@ impl<D> From<ZipArchive<D>> for ZipFS<D> {
 impl ZipFS<Arc<[u8]>> {
     /// Reads the archive file at `path` into memory and opens it.
     ///
-    /// Uses `tokio::fs`, so it must run within a tokio runtime.
+    /// Uses `tokio::fs`, so it must run within a tokio runtime. To read the file on demand
+    /// instead, use [`ZipFS::from_source`] with a [`FileSource`](crate::FileSource).
     pub async fn from_file(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
         let data = tokio::fs::read(path).await?;
         Self::new(Arc::from(data))
     }
 }
 
-/// A file opened from a [`ZipFS`].
+impl<S: AsyncSource> ZipFS<Source<S>> {
+    /// Fetches the central directory of the archive in `source`; see [`SourceArchive::open`].
+    ///
+    /// ```no_run
+    /// # async fn example() -> std::io::Result<()> {
+    /// use lunchbox::ReadableFileSystem;
+    /// use zipfs::{FileSource, ZipFS};
+    ///
+    /// let fs = ZipFS::from_source(FileSource::open("assets.zip").await?).await?;
+    /// let sprite = fs.read("images/sprite.png").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_source(source: S) -> io::Result<Self> {
+        Ok(Self {
+            archive: SourceArchive::open(source).await?,
+        })
+    }
+}
+
+impl<S: AsyncSource> From<SourceArchive<S>> for ZipFS<Source<S>> {
+    fn from(archive: SourceArchive<S>) -> Self {
+        Self { archive }
+    }
+}
+
+/// A file opened from a [`ZipFS`] that holds its archive in memory.
 ///
 /// Clones made with [`ReadableFile::try_clone`] share the read position (and decoder), like
 /// duplicated file handles. The file also implements [`AsyncSeek`]; in a compressed file,
@@ -118,6 +198,89 @@ struct Stream<D: AsRef<[u8]>> {
     offset: u64,
 }
 
+/// How a file's contents are encoded.
+#[derive(Debug, Clone, Copy)]
+struct Encoding {
+    method: Method,
+    uncompressed_size: u64,
+    crc32: u32,
+}
+
+/// Reads at `position` from the encoded contents in `data[range]` into `out`, decoding
+/// incrementally with the decoder kept in `stream`.
+fn read_decoded<D: AsRef<[u8]> + Clone>(
+    stream: &mut Option<Stream<D>>,
+    position: &mut u64,
+    data: &D,
+    range: Range<usize>,
+    encoding: Encoding,
+    out: &mut [u8],
+) -> io::Result<usize> {
+    // A backward seek restarts decoding; the first read starts it.
+    if stream
+        .as_ref()
+        .is_none_or(|stream| stream.offset > *position)
+    {
+        *stream = Some(Stream {
+            decoding: Decoding::new(
+                OwnedSource::new(data.clone(), range),
+                encoding.method,
+                encoding.uncompressed_size,
+                encoding.crc32,
+            )?,
+            offset: 0,
+        });
+    }
+    let stream = stream.as_mut().expect("created above");
+
+    // A forward seek decodes and discards the skipped bytes.
+    let mut scratch = [0u8; 8 * 1024];
+    while stream.offset < *position {
+        let skip = (*position - stream.offset).min(scratch.len() as u64) as usize;
+        let skipped = stream.decoding.read(&mut scratch[..skip])?;
+        if skipped == 0 {
+            // Positioned past the end of the file.
+            return Ok(0);
+        }
+        stream.offset += skipped as u64;
+    }
+
+    let read = stream.decoding.read(out)?;
+    stream.offset += read as u64;
+    *position = stream.offset;
+    Ok(read)
+}
+
+/// Copies from `contents`, which start at `start` in the file, at `position` into `out`.
+fn copy_at(contents: &[u8], start: u64, position: &mut u64, out: &mut [u8]) -> usize {
+    let from = usize::try_from(*position - start)
+        .unwrap_or(usize::MAX)
+        .min(contents.len());
+    let len = out.len().min(contents.len() - from);
+    out[..len].copy_from_slice(&contents[from..from + len]);
+    *position += len as u64;
+    len
+}
+
+/// The position a seek from `position` in a file of `len` bytes moves to.
+fn seek_target(position: u64, len: u64, seek: SeekFrom) -> io::Result<u64> {
+    let target = match seek {
+        SeekFrom::Start(offset) => Some(offset),
+        SeekFrom::End(offset) => len.checked_add_signed(offset),
+        SeekFrom::Current(offset) => position.checked_add_signed(offset),
+    };
+    target.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid seek to a negative or overflowing position",
+        )
+    })
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl<D: AsRef<[u8]>> File<D> {
     fn new(data: D, location: FileLocation) -> Self {
         Self {
@@ -129,65 +292,38 @@ impl<D: AsRef<[u8]>> File<D> {
             })),
         }
     }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, FileState<D>> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 }
 
 impl<D: AsRef<[u8]> + Clone> File<D> {
     /// Reads at the shared position into `out`, decoding compressed files incrementally.
     fn read_at_position(&self, out: &mut [u8]) -> io::Result<usize> {
         let location = &self.location;
-        let mut state = self.lock();
+        let mut state = lock(&self.state);
         let FileState { position, stream } = &mut *state;
 
         // Stored files are served straight from the archive bytes, unless they must be checked
         // against their CRC-32, in which case they go through the decoder like compressed ones.
         if location.method == Method::Stored && !location.verify {
             let contents = &self.data.as_ref()[location.range.clone()];
-            let start = usize::try_from(*position)
-                .unwrap_or(usize::MAX)
-                .min(contents.len());
-            let len = out.len().min(contents.len() - start);
-            out[..len].copy_from_slice(&contents[start..start + len]);
-            *position = (start + len) as u64;
-            return Ok(len);
-        }
-
-        // A backward seek restarts decoding; the first read starts it.
-        if stream
-            .as_ref()
-            .is_none_or(|stream| stream.offset > *position)
-        {
-            *stream = Some(Stream {
-                decoding: Decoding::new(
-                    OwnedSource::new(self.data.clone(), location.range.clone()),
-                    location.method,
-                    location.uncompressed_size,
-                    location.crc32,
-                )?,
-                offset: 0,
-            });
-        }
-        let stream = stream.as_mut().expect("created above");
-
-        // A forward seek decodes and discards the skipped bytes.
-        let mut scratch = [0u8; 8 * 1024];
-        while stream.offset < *position {
-            let skip = (*position - stream.offset).min(scratch.len() as u64) as usize;
-            let skipped = stream.decoding.read(&mut scratch[..skip])?;
-            if skipped == 0 {
-                // Positioned past the end of the file.
+            if *position >= contents.len() as u64 {
                 return Ok(0);
             }
-            stream.offset += skipped as u64;
+            return Ok(copy_at(contents, 0, position, out));
         }
 
-        let read = stream.decoding.read(out)?;
-        stream.offset += read as u64;
-        *position = stream.offset;
-        Ok(read)
+        let encoding = Encoding {
+            method: location.method,
+            uncompressed_size: location.uncompressed_size,
+            crc32: location.crc32,
+        };
+        read_decoded(
+            stream,
+            position,
+            &self.data,
+            location.range.clone(),
+            encoding,
+            out,
+        )
     }
 }
 
@@ -204,24 +340,13 @@ impl<D: AsRef<[u8]> + Clone + Unpin> AsyncRead for File<D> {
 
 impl<D: AsRef<[u8]> + Unpin> AsyncSeek for File<D> {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
-        let len = self.location.uncompressed_size;
-        let mut state = self.lock();
-        let target = match position {
-            SeekFrom::Start(offset) => Some(offset),
-            SeekFrom::End(offset) => len.checked_add_signed(offset),
-            SeekFrom::Current(offset) => state.position.checked_add_signed(offset),
-        };
-        state.position = target.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid seek to a negative or overflowing position",
-            )
-        })?;
+        let mut state = lock(&self.state);
+        state.position = seek_target(state.position, self.location.uncompressed_size, position)?;
         Ok(())
     }
 
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        Poll::Ready(Ok(self.lock().position))
+        Poll::Ready(Ok(lock(&self.state).position))
     }
 }
 
@@ -244,8 +369,193 @@ where
     }
 }
 
-impl<D: AsRef<[u8]>> HasFileType for ZipFS<D> {
-    type FileType = File<D>;
+/// Bytes fetched per read of a stored file from an [`AsyncSource`].
+const CHUNK_SIZE: u64 = 64 * 1024;
+
+#[cfg(not(target_family = "wasm"))]
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+#[cfg(target_family = "wasm")]
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+
+/// A file opened from a [`ZipFS`] that reads its archive from an [`AsyncSource`].
+///
+/// Behaves like [`File`]: clones share the read position and decoder, and seeking works
+/// anywhere. Reads wait for the source: a stored file is fetched in 64 KiB chunks around the
+/// read position, a compressed file's compressed bytes are fetched whole on its first read.
+pub struct SourceFile<S> {
+    source: Arc<S>,
+    location: Arc<SourceLocation>,
+    state: Arc<Mutex<SourceState>>,
+    /// This handle's fetch in progress. Behind a mutex only so the file is `Sync`; it is
+    /// accessed through `&mut self`.
+    pending: Mutex<Option<Pending>>,
+}
+
+struct SourceState {
+    position: u64,
+    /// The last chunk fetched from a stored file, with its offset in the file.
+    chunk: Option<(u64, Vec<u8>)>,
+    /// A compressed file's compressed bytes, fetched on first read.
+    compressed: Option<Arc<[u8]>>,
+    stream: Option<Stream<Arc<[u8]>>>,
+}
+
+struct Pending {
+    /// Offset in the file of the chunk being fetched; `None` for compressed bytes.
+    chunk_at: Option<u64>,
+    future: BoxFuture<io::Result<Vec<u8>>>,
+}
+
+impl<S: AsyncSource> SourceFile<S> {
+    fn new(source: Arc<S>, location: SourceLocation) -> Self {
+        Self {
+            source,
+            location: Arc::new(location),
+            state: Arc::new(Mutex::new(SourceState {
+                position: 0,
+                chunk: None,
+                compressed: None,
+                stream: None,
+            })),
+            pending: Mutex::new(None),
+        }
+    }
+
+    fn fetch(&self, range: Range<u64>, chunk_at: Option<u64>) -> Pending {
+        let source = Arc::clone(&self.source);
+        let size = self.location.range.end;
+        Pending {
+            chunk_at,
+            future: Box::pin(async move { source::fetch(&*source, size, range).await }),
+        }
+    }
+
+    /// Reads at the shared position into `out` from what was fetched, or returns the fetch
+    /// that the read needs.
+    fn try_read(&self, out: &mut [u8]) -> Result<io::Result<usize>, Pending> {
+        let location = &*self.location;
+        let mut state = lock(&self.state);
+        let SourceState {
+            position,
+            chunk,
+            compressed,
+            stream,
+        } = &mut *state;
+        if out.is_empty() || *position >= location.uncompressed_size {
+            return Ok(Ok(0));
+        }
+
+        if location.method == Method::Stored {
+            let len = location.uncompressed_size;
+            if let Some((start, bytes)) = chunk {
+                if (*start..*start + bytes.len() as u64).contains(position) {
+                    return Ok(Ok(copy_at(bytes, *start, position, out)));
+                }
+            }
+            let start = *position;
+            let end = (start + CHUNK_SIZE).min(len);
+            let range = location.range.start + start..location.range.start + end;
+            return Err(self.fetch(range, Some(start)));
+        }
+
+        let Some(data) = compressed else {
+            return Err(self.fetch(location.range.clone(), None));
+        };
+        let encoding = Encoding {
+            method: location.method,
+            uncompressed_size: location.uncompressed_size,
+            crc32: location.crc32,
+        };
+        let range = 0..data.len();
+        Ok(read_decoded(stream, position, data, range, encoding, out))
+    }
+}
+
+impl<S: AsyncSource> AsyncRead for SourceFile<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            let pending = this
+                .pending
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(fetch) = pending {
+                let fetched = ready!(fetch.future.as_mut().poll(cx));
+                let chunk_at = fetch.chunk_at;
+                *pending = None;
+                let bytes = fetched?;
+                let mut state = lock(&this.state);
+                match chunk_at {
+                    Some(start) => state.chunk = Some((start, bytes)),
+                    None => state.compressed = Some(Arc::from(bytes)),
+                }
+            }
+            match this.try_read(buf.initialize_unfilled()) {
+                Ok(read) => return Poll::Ready(read.map(|count| buf.advance(count))),
+                Err(fetch) => {
+                    *this
+                        .pending
+                        .get_mut()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(fetch);
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncSource> AsyncSeek for SourceFile<S> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        state.position = seek_target(state.position, self.location.uncompressed_size, position)?;
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(lock(&self.state).position))
+    }
+}
+
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+impl<S: AsyncSource> ReadableFile for SourceFile<S> {
+    async fn metadata(&self) -> io::Result<LunchboxMetadata> {
+        Ok(to_lunchbox(&self.location.metadata))
+    }
+
+    async fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            source: Arc::clone(&self.source),
+            location: Arc::clone(&self.location),
+            state: Arc::clone(&self.state),
+            pending: Mutex::new(None),
+        })
+    }
+}
+
+impl<B: Backend> HasFileType for ZipFS<B> {
+    type FileType = B::File;
+}
+
+/// Lists `path` for [`ReadableFileSystem::read_dir`]: `(file name, path from the root)` in
+/// reverse order, since entries are handed out with `pop`.
+fn dir_listing(base: &str, entries: Vec<archive::DirEntry<'_>>) -> Vec<(String, PathBuf)> {
+    let mut listing: Vec<(String, PathBuf)> = entries
+        .into_iter()
+        .map(|entry| {
+            let child = if base.is_empty() {
+                entry.name.to_string()
+            } else {
+                format!("{base}/{}", entry.name)
+            };
+            (entry.name.to_string(), PathBuf::from(child))
+        })
+        .collect();
+    listing.reverse();
+    listing
 }
 
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
@@ -288,21 +598,7 @@ where
     ) -> io::Result<ReadDir<Self::ReadDirPollerType, Self>> {
         let path = path.as_ref().as_str();
         let base = self.archive.canonicalize(path)?;
-        let mut entries: Vec<(String, PathBuf)> = self
-            .archive
-            .read_dir(path)?
-            .into_iter()
-            .map(|entry| {
-                let child = if base.is_empty() {
-                    entry.name.to_string()
-                } else {
-                    format!("{base}/{}", entry.name)
-                };
-                (entry.name.to_string(), PathBuf::from(child))
-            })
-            .collect();
-        // Entries are handed out with `pop`, so reverse to keep them sorted by name.
-        entries.reverse();
+        let entries = dir_listing(&base, self.archive.read_dir(path)?);
         Ok(ReadDir::new(ZipReadDirPoller { entries }, self))
     }
 
@@ -323,21 +619,82 @@ where
     }
 }
 
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+impl<S: AsyncSource> ReadableFileSystem for ZipFS<Source<S>> {
+    async fn open(&self, path: impl PathType) -> io::Result<Self::FileType>
+    where
+        Self::FileType: ReadableFile,
+    {
+        let location = self.archive.locate_file(path.as_ref().as_str()).await?;
+        Ok(SourceFile::new(
+            Arc::clone(self.archive.shared_source()),
+            location,
+        ))
+    }
+
+    async fn canonicalize(&self, path: impl PathType) -> io::Result<PathBuf> {
+        self.archive
+            .canonicalize(path.as_ref().as_str())
+            .map(PathBuf::from)
+    }
+
+    async fn metadata(&self, path: impl PathType) -> io::Result<LunchboxMetadata> {
+        self.archive
+            .metadata(path.as_ref().as_str())
+            .map(|metadata| to_lunchbox(&metadata))
+    }
+
+    async fn read(&self, path: impl PathType) -> io::Result<Vec<u8>> {
+        self.archive.read(path.as_ref().as_str()).await
+    }
+
+    type ReadDirPollerType = ZipReadDirPoller;
+
+    async fn read_dir(
+        &self,
+        path: impl PathType,
+    ) -> io::Result<ReadDir<Self::ReadDirPollerType, Self>> {
+        let path = path.as_ref().as_str();
+        let base = self.archive.canonicalize(path)?;
+        let entries = dir_listing(&base, self.archive.read_dir(path)?);
+        Ok(ReadDir::new(ZipReadDirPoller { entries }, self))
+    }
+
+    async fn read_link(&self, path: impl PathType) -> io::Result<PathBuf> {
+        self.archive
+            .read_link(path.as_ref().as_str())
+            .map(PathBuf::from)
+    }
+
+    async fn read_to_string(&self, path: impl PathType) -> io::Result<String> {
+        self.archive.read_to_string(path.as_ref().as_str()).await
+    }
+
+    async fn symlink_metadata(&self, path: impl PathType) -> io::Result<LunchboxMetadata> {
+        self.archive
+            .symlink_metadata(path.as_ref().as_str())
+            .map(|metadata| to_lunchbox(&metadata))
+    }
+}
+
 /// Yields the entries of a [`ZipFS`] directory; see [`ReadableFileSystem::read_dir`].
 pub struct ZipReadDirPoller {
     /// `(file name, path from the archive root)`, in reverse order.
     entries: Vec<(String, PathBuf)>,
 }
 
-impl<D> ReadDirPoller<ZipFS<D>> for ZipReadDirPoller
+impl<B> ReadDirPoller<ZipFS<B>> for ZipReadDirPoller
 where
-    D: AsRef<[u8]> + Clone + Unpin + MaybeSend + MaybeSync,
+    B: Backend,
+    <ZipFS<B> as HasFileType>::FileType: ReadableFile,
+    ZipFS<B>: ReadableFileSystem,
 {
     fn poll_next_entry<'a>(
         &mut self,
         _cx: &mut Context<'_>,
-        fs: &'a ZipFS<D>,
-    ) -> Poll<io::Result<Option<DirEntry<'a, ZipFS<D>>>>> {
+        fs: &'a ZipFS<B>,
+    ) -> Poll<io::Result<Option<DirEntry<'a, ZipFS<B>>>>> {
         Poll::Ready(Ok(self
             .entries
             .pop()

@@ -30,10 +30,16 @@ mod index;
 mod paths;
 mod reader;
 #[cfg(feature = "lunchbox")]
+mod source;
+#[cfg(feature = "lunchbox")]
 mod vfs;
 
 pub use archive::ZipArchive;
 pub use format::{EntryKind, Method, ZipSlice};
 pub use reader::EntryReader;
+#[cfg(all(feature = "lunchbox", not(target_family = "wasm"), any(unix, windows)))]
+pub use source::FileSource;
 #[cfg(feature = "lunchbox")]
-pub use vfs::{File, ZipFS, ZipReadDirPoller};
+pub use source::{AsyncSource, SourceArchive};
+#[cfg(feature = "lunchbox")]
+pub use vfs::{Backend, File, Source, SourceFile, ZipFS, ZipReadDirPoller};
