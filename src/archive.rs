@@ -41,6 +41,9 @@ pub struct ZipArchive<D> {
     /// Largest uncompressed size that `read` decompresses in one call; see
     /// [`ZipArchive::with_one_shot_limit`].
     one_shot_limit: u64,
+    /// Whether borrowed reads of stored files check their CRC-32; see
+    /// [`ZipArchive::with_verified_stored_reads`].
+    verify_stored: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +68,8 @@ pub(crate) struct FileLocation {
     pub(crate) uncompressed_size: u64,
     pub(crate) crc32: u32,
     pub(crate) metadata: Metadata,
+    /// Whether a stored file must be checked against its CRC-32 while it is read.
+    pub(crate) verify: bool,
 }
 
 /// Metadata of a file, directory or symlink in the archive.
@@ -165,7 +170,51 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
             sorted: deduplicated,
             names,
             one_shot_limit: u64::MAX,
+            verify_stored: false,
         })
+    }
+
+    /// Checks the CRC-32 of stored (uncompressed) files on every read when `enabled`.
+    ///
+    /// By default, [`read`](Self::read), [`read_borrowed`](ZipArchive::read_borrowed) and
+    /// `ZipFS` files return stored files without checking them, since that means reading every
+    /// byte; compressed files are always checked as they are decompressed. With verification
+    /// on, borrowed reads compute the CRC-32 before returning (and fail with
+    /// [`ErrorKind::InvalidData`] on a mismatch), and `ZipFS` files check it when the end of
+    /// the file is reached. To check a whole archive once instead, use
+    /// [`verify_all`](Self::verify_all).
+    #[must_use]
+    pub fn with_verified_stored_reads(mut self, enabled: bool) -> Self {
+        self.verify_stored = enabled;
+        self
+    }
+
+    /// Whether stored files are checked on every read; see
+    /// [`with_verified_stored_reads`](Self::with_verified_stored_reads).
+    pub fn verifies_stored_reads(&self) -> bool {
+        self.verify_stored
+    }
+
+    /// Checks every file and symlink in the archive: each is decompressed (or read, if stored)
+    /// and its size and CRC-32 compared with the central directory. Memory use is constant.
+    ///
+    /// The first failure is returned, with the path in its message. Useful once at startup to
+    /// trust an asset archive before serving borrowed, unchecked reads from it.
+    pub fn verify_all(&self) -> io::Result<()> {
+        for &index in &self.sorted {
+            let entry = &self.entries[index];
+            if entry.kind == EntryKind::Directory {
+                continue;
+            }
+            let with_path =
+                |err: io::Error| io::Error::new(err.kind(), format!("{}: {err}", self.name(index)));
+            let raw = self.raw_data(entry).map_err(with_path)?;
+            let mut reader =
+                EntryReader::new(raw, entry.method, entry.uncompressed_size, entry.crc32)
+                    .map_err(with_path)?;
+            io::copy(&mut reader, &mut io::sink()).map_err(with_path)?;
+        }
+        Ok(())
     }
 
     /// Sets the largest file, in uncompressed bytes, that [`read`](Self::read) decompresses in
@@ -450,6 +499,9 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     fn entry_bytes(&self, entry: &IndexedEntry) -> io::Result<Cow<'_, [u8]>> {
         let raw = self.raw_data(entry)?;
         if entry.method == Method::Stored {
+            if self.verify_stored {
+                reader::verify_crc(raw, entry.crc32)?;
+            }
             return Ok(Cow::Borrowed(raw));
         }
         reader::decompress(
@@ -480,6 +532,7 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
             uncompressed_size: entry.uncompressed_size,
             crc32: entry.crc32,
             metadata: self.entry_metadata(entry),
+            verify: self.verify_stored,
         })
     }
 }
@@ -508,7 +561,11 @@ impl<'a> ZipArchive<&'a [u8]> {
             entry.method,
             entry.uncompressed_size,
         )?;
-        Ok(&data[range])
+        let contents = &data[range];
+        if self.verify_stored {
+            reader::verify_crc(contents, entry.crc32)?;
+        }
+        Ok(contents)
     }
 }
 

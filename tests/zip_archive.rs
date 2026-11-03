@@ -768,6 +768,77 @@ fn crc_mismatch_fails_the_streaming_reader() {
 }
 
 #[test]
+fn verified_stored_reads_catch_crc_mismatches() {
+    let mut corrupt = Hand::file(b"dir/corrupt.txt", b"payload");
+    corrupt.crc = Some(0xDEAD_BEEF);
+    let link = Hand::symlink(b"link", b"dir/corrupt.txt");
+    let bytes = build(&[Hand::file(b"ok.txt", b"fine"), corrupt, link], b"");
+
+    // Unchecked by default.
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert!(!zip.verifies_stored_reads());
+    assert_eq!(&*zip.read("dir/corrupt.txt").unwrap(), b"payload");
+    assert_eq!(zip.read_borrowed("link").unwrap(), b"payload");
+
+    let zip = ZipArchive::new(&bytes[..])
+        .unwrap()
+        .with_verified_stored_reads(true);
+    assert!(zip.verifies_stored_reads());
+    assert_eq!(&*zip.read("ok.txt").unwrap(), b"fine");
+    assert_eq!(zip.read_borrowed("ok.txt").unwrap(), b"fine");
+    for path in ["dir/corrupt.txt", "link"] {
+        assert_eq!(
+            zip.read(path).unwrap_err().kind(),
+            ErrorKind::InvalidData,
+            "{path}"
+        );
+        assert_eq!(
+            zip.read_borrowed(path).unwrap_err().kind(),
+            ErrorKind::InvalidData,
+            "{path}"
+        );
+    }
+
+    let slice = ZipSlice::new(&bytes).unwrap();
+    assert_eq!(slice.get("dir/corrupt.txt").unwrap(), b"payload");
+    assert_eq!(slice.get_verified("ok.txt").unwrap(), b"fine");
+    assert_eq!(
+        slice.get_verified("link").unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(
+        slice.get_verified("dir").unwrap_err().kind(),
+        ErrorKind::IsADirectory
+    );
+}
+
+#[test]
+fn verify_all_checks_every_file() {
+    for bytes in [STORED, NO_DIR_ENTRIES, EXTERNAL_SYMLINK, LONG_SYMLINK] {
+        ZipArchive::new(bytes).unwrap().verify_all().unwrap();
+    }
+    if cfg!(feature = "deflate") {
+        ZipArchive::new(SYMLINKS).unwrap().verify_all().unwrap();
+    }
+
+    let mut corrupt = Hand::file(b"nested/bad.bin", b"payload");
+    corrupt.crc = Some(1);
+    let bytes = build(&[Hand::file(b"good.txt", b"fine"), corrupt], b"");
+    let err = ZipArchive::new(&bytes[..])
+        .unwrap()
+        .verify_all()
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(err.to_string().contains("nested/bad.bin"), "{err}");
+
+    let err = ZipArchive::new(CORRUPT_LOCAL_HEADER)
+        .unwrap()
+        .verify_all()
+        .unwrap_err();
+    assert!(err.to_string().contains("readme.txt"), "{err}");
+}
+
+#[test]
 fn directory_entries_from_dos_attributes_and_root_entries() {
     let mut root = Hand::file(b"./", b"");
     root.mode = 0o040_755;

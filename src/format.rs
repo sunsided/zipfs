@@ -345,6 +345,23 @@ impl<'a> ZipSlice<'a> {
         Ok(&buffer[..len])
     }
 
+    /// Like [`get`](Self::get), but checks the file's CRC-32 before returning it.
+    ///
+    /// Fails with [`ErrorKind::InvalidData`] on a mismatch. This reads every byte of the file;
+    /// [`get`](Self::get) does not.
+    pub fn get_verified(&self, path: &str) -> io::Result<&'a [u8]> {
+        let (resolved, entry) = self.resolve(path)?;
+        if entry.kind() == EntryKind::Directory {
+            return Err(io::Error::new(
+                ErrorKind::IsADirectory,
+                format!("is a directory: {resolved}"),
+            ));
+        }
+        let contents = self.stored_data(&entry)?;
+        crate::reader::verify_crc(contents, entry.crc32())?;
+        Ok(contents)
+    }
+
     /// Borrows the contents of a stored (uncompressed) entry.
     pub fn stored_data(&self, entry: &Entry<'a>) -> io::Result<&'a [u8]> {
         if entry.is_encrypted() {

@@ -277,6 +277,18 @@ fn inflate<S: Source>(
     }
 }
 
+/// Checks a stored entry's bytes against the CRC-32 recorded in the central directory.
+pub(crate) fn verify_crc(data: &[u8], expected: u32) -> io::Result<()> {
+    if crate::crc32::checksum(data) == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "zip entry CRC-32 mismatch",
+        ))
+    }
+}
+
 /// Upper bound for the up-front allocation when streaming an entry, so a forged size in the
 /// central directory cannot trigger a huge allocation before any data has been read.
 const MAX_PREALLOCATION: u64 = 16 * 1024 * 1024;
