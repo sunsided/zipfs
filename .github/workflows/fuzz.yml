@@ -40,11 +40,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      # The fuzz targets need nightly; cargo-fuzz itself is built with stable, because its
+      # locked dependencies (an old rustix) enable nightly-only attributes that current
+      # nightly rejects.
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked --version 0.13.1
+      - run: cargo +stable install cargo-fuzz --locked --version 0.13.1
       - name: cargo fuzz run
         env:
           TARGET: ${{ matrix.target }}
