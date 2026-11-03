@@ -40,6 +40,10 @@ const MAX_SYMLINK_HOPS: usize = 40;
 /// central directory cannot trigger a huge allocation before any data has been read.
 const MAX_PREALLOCATION: u64 = 16 * 1024 * 1024;
 
+/// Largest symlink target accepted. Real targets are short paths; the cap stops a forged
+/// "symlink" entry from being used to read an arbitrarily large blob while resolving paths.
+const MAX_SYMLINK_TARGET: u64 = 4096;
+
 /// A zip archive held in memory, read without async.
 ///
 /// `D` is anything that derefs to the archive bytes: `&'static [u8]` from `include_bytes!`,
@@ -254,6 +258,17 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
 
     /// Reads a symlink entry's target and resolves it relative to the link's directory.
     fn link_target(&self, link_path: &str, entry: &Entry) -> io::Result<String> {
+        // The declared size bounds the bytes actually read: `EntryReader` fails on any output
+        // beyond it, and stored slices are exactly `compressed_size == uncompressed_size` long.
+        if entry.uncompressed_size > MAX_SYMLINK_TARGET {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "symlink target of {} exceeds {MAX_SYMLINK_TARGET} bytes",
+                    entry.name
+                ),
+            ));
+        }
         let target = String::from_utf8(self.entry_bytes(entry)?.into_owned())
             .map_err(|_| io::Error::new(ErrorKind::InvalidData, "symlink target is not UTF-8"))?;
         if target.starts_with('/') {
@@ -289,6 +304,7 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
         Ok(EntryReader {
             source,
             fsm: Some(EntryFsm::new(Some(entry.clone()), None)),
+            remaining: entry.uncompressed_size,
         })
     }
 
@@ -336,13 +352,29 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
 ///
 /// The driving loop follows `rc_zip_sync::EntryReader` (Apache-2.0 OR MIT), whose constructor is
 /// private to that crate.
+///
+/// Output is capped at the uncompressed size declared in the central directory. rc-zip only
+/// compares the actual size with the declared one after all compressed input is consumed, so
+/// without the cap a small, highly compressed entry could expand without bound before that check
+/// (a decompression bomb).
 pub struct EntryReader<'a> {
     source: &'a [u8],
     fsm: Option<EntryFsm>,
+    /// Declared uncompressed bytes not yet returned.
+    remaining: u64,
 }
 
 impl Read for EntryReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Let the decompressor produce at most one byte more than declared, which is enough to
+        // detect an overrun without decompressing further.
+        let limit = usize::try_from(self.remaining.saturating_add(1))
+            .map_or(buf.len(), |l| l.min(buf.len()));
+        let buf = &mut buf[..limit];
+
         loop {
             let Some(mut fsm) = self.fsm.take() else {
                 return Ok(0);
@@ -356,6 +388,15 @@ impl Read for EntryReader<'_> {
 
             match fsm.process(buf).map_err(rc_zip_error_to_io)? {
                 FsmResult::Continue((fsm, outcome)) => {
+                    let written = outcome.bytes_written as u64;
+                    if written > self.remaining {
+                        // `self.fsm` stays `None`: the reader is poisoned and yields no more data.
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "zip entry decompresses to more than its declared size",
+                        ));
+                    }
+                    self.remaining -= written;
                     self.fsm = Some(fsm);
                     if outcome.bytes_written > 0 {
                         return Ok(outcome.bytes_written);
@@ -469,6 +510,11 @@ mod tests {
     static NO_DIR_ENTRIES: &[u8] = include_bytes!("../test_data/no_dir_entries.zip");
     static SYMLINKS: &[u8] = include_bytes!("../test_data/symlink_test.zip");
     static EXTERNAL_SYMLINK: &[u8] = include_bytes!("../test_data/external_symlink.zip");
+    /// 8 MiB of zeros, deflated, with the declared uncompressed size patched to 16 bytes.
+    #[cfg(feature = "deflate")]
+    static SIZE_BOMB: &[u8] = include_bytes!("../test_data/size_bomb.zip");
+    /// A symlink entry whose stored target is 5000 bytes long.
+    static LONG_SYMLINK: &[u8] = include_bytes!("../test_data/long_symlink.zip");
 
     fn names(entries: &[DirEntry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
@@ -535,6 +581,39 @@ mod tests {
         let zip = ZipArchive::new(EXTERNAL_SYMLINK).unwrap();
         assert!(zip.read_link("symlink_to_etc_passwd").is_err());
         assert!(zip.read("symlink_to_etc_passwd").is_err());
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn output_is_capped_at_declared_size() {
+        let zip = ZipArchive::new(SIZE_BOMB).unwrap();
+
+        let err = zip.read("bomb.bin").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+
+        let mut out = Vec::new();
+        let err = zip
+            .open("bomb.bin")
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+        assert!(
+            out.len() <= 16,
+            "read {} bytes past the declared 16",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn oversized_symlink_targets_are_rejected() {
+        let zip = ZipArchive::new(LONG_SYMLINK).unwrap();
+        assert_eq!(
+            zip.read_link("link").unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(zip.read("link").unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(zip.read_to_string("a").unwrap(), "target");
     }
 
     #[cfg(feature = "deflate")]
