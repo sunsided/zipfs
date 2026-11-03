@@ -18,7 +18,7 @@ crc32fast = { version = "1.5", optional = true }
 # The `lunchbox` feature: `ZipFS`, an async lunchbox filesystem.
 lunchbox = { version = "0.1", optional = true, default-features = false }
 async-trait = { version = "0.1", optional = true }
-tokio = { version = "1", optional = true, default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # `ZipFS::from_file` reads archive files with tokio::fs.
