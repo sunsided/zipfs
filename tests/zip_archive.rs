@@ -8,7 +8,7 @@ use std::io::{self, Cursor, ErrorKind, Read, Write};
 
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
-use zipfs::{EntryKind, Method, ZipArchive, ZipSlice};
+use zipfs_ng::{EntryKind, Method, ZipArchive, ZipSlice};
 
 static STORED: &[u8] = include_bytes!("../test_data/stored_only.zip");
 static NO_DIR_ENTRIES: &[u8] = include_bytes!("../test_data/no_dir_entries.zip");
@@ -158,7 +158,7 @@ fn compression_id(method: CompressionMethod) -> u16 {
     }
 }
 
-fn names<'z>(entries: &[zipfs::archive::DirEntry<'z>]) -> Vec<&'z str> {
+fn names<'z>(entries: &[zipfs_ng::archive::DirEntry<'z>]) -> Vec<&'z str> {
     entries.iter().map(|e| e.name).collect()
 }
 

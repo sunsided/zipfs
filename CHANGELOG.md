@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ## 0.1.0 - Unreleased
 
-A rewrite around an in-house zip reader. `ZipFS` is still the crate's Lunchbox filesystem, but
+First release as `zipfs-ng`, continuing `zipfs` 0.0.2. A rewrite around an in-house zip reader. `ZipFS` is still the crate's Lunchbox filesystem, but
 it is now optional and built on synchronous, zero-copy archive types that work without any
 async runtime.
 
@@ -37,6 +37,7 @@ async runtime.
 
 ### Changed
 
+- **Breaking:** the crate is published as `zipfs-ng` and imported as `zipfs_ng`.
 - **Breaking:** `ZipFS` and the Lunchbox integration are behind the `lunchbox` feature, which
   is not enabled by default.
 - **Breaking:** `ZipFS<B>` is generic over a sealed `Backend`: `ZipFS<D>` for archives in
@@ -63,6 +64,6 @@ async runtime.
 
 ## [0.0.2]
 
-Last release of the original crate, an async filesystem over `async_zip`.
+Last release of the original `zipfs` crate, an async filesystem over `async_zip`.
 
 [0.0.2]: https://crates.io/crates/zipfs/0.0.2

@@ -441,7 +441,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zipfs"
+name = "zipfs-ng"
 version = "0.1.0"
 dependencies = [
  "async-trait",

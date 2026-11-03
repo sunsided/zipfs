@@ -10,7 +10,7 @@ use std::io::Read;
 
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
-use zipfs::{ZipArchive, ZipSlice};
+use zipfs_ng::{ZipArchive, ZipSlice};
 
 #[derive(Debug, Arbitrary)]
 enum Method {

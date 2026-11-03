@@ -6,7 +6,7 @@
 //!
 //! ```
 //! # fn main() -> std::io::Result<()> {
-//! use zipfs::ZipSlice;
+//! use zipfs_ng::ZipSlice;
 //!
 //! static ASSETS: &[u8] = include_bytes!("../test_data/stored_only.zip");
 //!
