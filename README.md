@@ -10,7 +10,7 @@ See the lunchbox docs for usage details.
 
 # Getting started
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.87 or newer.
 
 ```toml
 [dependencies]
