@@ -1,0 +1,36 @@
+# cargo-release configuration (https://github.com/crate-ci/cargo-release).
+#
+# Release from an up-to-date main with a clean tree:
+#
+#     cargo release patch            # dry run: shows what would happen
+#     cargo release patch --execute  # bump, commit, publish, tag, push
+#
+# Use `minor`/`major` as needed, or no level to release the version in Cargo.toml as-is.
+# Publishing needs a crates.io token (`cargo login`). Pushing the `vX.Y.Z` tag triggers the
+# Release workflow, which creates the GitHub Release from the changelog section.
+
+allow-branch = ["main"]
+push-remote = "origin"
+publish = true
+push = true
+verify = true
+
+tag-name = "v{{version}}"
+tag-message = "zipfs-ng {{version}}"
+pre-release-commit-message = "Release zipfs-ng {{version}}"
+
+# The fuzz crate is a separate workspace with its own lockfile that pins this crate's version.
+pre-release-hook = ["cargo", "update", "--manifest-path", "fuzz/Cargo.toml", "--package", "zipfs-ng"]
+
+# Turn the Unreleased section into the release's section and start a new, empty one.
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = "## \\[Unreleased\\]"
+replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}"
+exactly = 1
+
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = "\\[Unreleased\\]: https://github\\.com/sunsided/zipfs/[^\\n]*"
+replace = "[Unreleased]: https://github.com/sunsided/zipfs/compare/{{tag_name}}...HEAD\n[{{version}}]: https://github.com/sunsided/zipfs/releases/tag/{{tag_name}}"
+exactly = 1

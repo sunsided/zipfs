@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
-## 0.1.0 - Unreleased
+## [Unreleased]
 
 First release as `zipfs-ng`, continuing `zipfs` 0.0.2. A rewrite around an in-house zip reader. `ZipFS` is still the crate's Lunchbox filesystem, but
 it is now optional and built on synchronous, zero-copy archive types that work without any
@@ -66,4 +66,5 @@ async runtime.
 
 Last release of the original `zipfs` crate, an async filesystem over `async_zip`.
 
+[Unreleased]: https://github.com/sunsided/zipfs/commits/main
 [0.0.2]: https://crates.io/crates/zipfs/0.0.2
