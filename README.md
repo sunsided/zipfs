@@ -12,6 +12,9 @@ copying stored (uncompressed) files.
   directory in place and borrows stored files for the lifetime of the bytes.
 - `ZipFS<D>` (feature `lunchbox`) is an async, read-only
   [Lunchbox](https://github.com/vivekpanyam/lunchbox) filesystem over the same archive.
+  `ZipFS<Source<S>>` is the same filesystem over an archive that is not in memory: it reads
+  from any `AsyncSource` (a file on disk, an HTTP range client, an object store) and fetches
+  only the central directory up front.
 
 # Getting started
 
@@ -72,6 +75,27 @@ async fn load(assets: &'static [u8]) -> std::io::Result<()> {
 }
 ```
 
+To read an archive on demand instead of loading it, open it from an `AsyncSource`.
+`FileSource` reads a local file with positional reads; implement `AsyncSource` (`size` and
+`read_at`) for anything else that serves byte ranges:
+
+```rust
+use lunchbox::ReadableFileSystem;
+use zipfs::{FileSource, Source, ZipFS};
+
+async fn load() -> std::io::Result<()> {
+    // Fetches the end records and the central directory; files are fetched when read.
+    let fs: ZipFS<Source<FileSource>> =
+        ZipFS::from_source(FileSource::open("assets.zip").await?).await?;
+    let sprite = fs.read("images/sprite.png").await?;
+    Ok(())
+}
+```
+
+Stored files are fetched in 64 KiB chunks as they are read. Compressed files are fetched whole
+(compressed) on their first read and decompressed incrementally, so keep very large files
+stored when serving from a remote source.
+
 # Features
 
 | Feature     | Default | Enables                                                              |
@@ -80,7 +104,7 @@ async fn load(assets: &'static [u8]) -> std::io::Result<()> {
 | `zstd`      | yes     | Reading Zstandard entries, via the pure-Rust `ruzstd`                |
 | `crc32fast` | yes     | Hardware-accelerated CRC-32 via `crc32fast`; otherwise a built-in implementation is used |
 | `full-symlinks` | no  | Follow symlinks in every path component (`linked_dir/file.png`), resolving `..` after links as POSIX does (entries stored below a symlinked directory are then shadowed by the link); by default only the last component is followed |
-| `lunchbox`  | no      | `ZipFS`, an async Lunchbox filesystem (adds `lunchbox`, `async-trait` and `tokio`) |
+| `lunchbox`  | no      | `ZipFS`, an async Lunchbox filesystem, and `SourceArchive` for archives read on demand from an `AsyncSource` (adds `lunchbox`, `async-trait` and `tokio`) |
 
 Everything is pure Rust and builds for WebAssembly, including `wasm32-wasip1`.
 

@@ -21,8 +21,8 @@ async-trait = { version = "0.1", optional = true }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-# `ZipFS::from_file` reads archive files with tokio::fs.
-tokio = { version = "1", optional = true, default-features = false, features = ["fs"] }
+# `ZipFS::from_file` and `FileSource` read archive files with tokio::fs and the blocking pool.
+tokio = { version = "1", optional = true, default-features = false, features = ["fs", "rt"] }
 
 [features]
 default = ["deflate", "zstd", "crc32fast"]
