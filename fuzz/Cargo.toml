@@ -1,0 +1,37 @@
+[package]
+name = "zipfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+zipfs = { path = "..", default-features = false, features = ["deflate", "zstd"] }
+
+# Keep the fuzz crate out of the zipfs workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slice"
+path = "fuzz_targets/slice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,27 @@
+# Zip record signatures
+"PK\x03\x04"
+"PK\x01\x02"
+"PK\x05\x06"
+"PK\x06\x06"
+"PK\x06\x07"
+"PK\x07\x08"
+# Extra field IDs: ZIP64, extended timestamp, Info-ZIP Unicode Path
+"\x01\x00"
+"UT"
+"up"
+# Overflow markers used by ZIP64
+"\xff\xff\xff\xff"
+"\xff\xff"
+# Compression methods: Deflate, Zstandard
+"\x08\x00"
+"\x5d\x00"
+# Unix file types in the upper attribute bits (directory, symlink, regular file)
+"\x00\x00\xedA"
+"\x00\x00\xff\xa1"
+"\x00\x00\xa4\x81"
+# Paths
+"/"
+"../"
+"./"
+"\\"
+"C:"

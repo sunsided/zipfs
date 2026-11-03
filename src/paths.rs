@@ -83,10 +83,19 @@ pub(crate) fn check_link_target_size(link_path: &str, size: u64) -> io::Result<(
 
 /// Resolves a symlink's target relative to the directory of the (normalized) link path.
 ///
-/// Absolute targets and targets that climb above the archive root are rejected.
+/// Empty targets are rejected with [`ErrorKind::InvalidData`]; absolute targets, targets that
+/// are not portable (NUL, drive letters) and targets that climb above the archive root with
+/// [`ErrorKind::InvalidInput`].
 pub(crate) fn resolve_link(link_path: &str, target: &[u8]) -> io::Result<String> {
     let target = std::str::from_utf8(target)
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "symlink target is not UTF-8"))?;
+    if target.is_empty() {
+        // POSIX does not allow empty symlink targets; do not resolve them to the link's parent.
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "symlink target is empty",
+        ));
+    }
     if target.starts_with(['/', '\\'])
         || target.contains('\0')
         || target.split(['/', '\\']).any(is_drive_letter)
@@ -174,6 +183,11 @@ mod tests {
     fn link_targets_must_be_portable_and_relative() {
         assert_eq!(resolve_link("dir/link", b"../a.txt").unwrap(), "a.txt");
         assert_eq!(resolve_link("dir/link", b"..\\a.txt").unwrap(), "a.txt");
+        assert_eq!(resolve_link("dir/link", b".").unwrap(), "dir");
+        assert_eq!(
+            resolve_link("dir/link", b"").unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
         for target in [
             &b"/etc/passwd"[..],
             b"\\server\\share",
