@@ -13,8 +13,12 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
-
 use async_trait::async_trait;
+// async_zip 0.0.19 deprecates the `read::seek` module in favour of `read1`. Porting to `read1` is
+// a larger change (different entry types), so it is deferred. The deprecation is allowed at each
+// of the three uses (this import, `ZipFS::new` and `open_no_follow_symlink`) rather than
+// crate-wide, so other deprecations still warn.
+#[allow(deprecated)]
 use async_zip::base::read::seek::ZipFileReader;
 use async_zip::base::read::{WithoutEntry, ZipEntryReader};
 use async_zip::{AttributeCompatibility, ZipEntry};
@@ -31,7 +35,7 @@ use std::io::{ErrorKind, Result};
 use std::ops::Deref;
 use std::pin::Pin;
 use std::task::Poll;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, BufReader};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 /// In order to open and read multiple files simultaneously, we need multiple AsyncRead + AsyncSeek streams for the
@@ -69,24 +73,62 @@ impl<T> ZipFS<T>
 where
     T: GetReader,
 {
-    pub async fn new(factory: T) -> ZipFS<T> {
-        let zip = ZipFileReader::new(factory.get().await.compat())
+    /// Opens the archive and reads its central directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Unsupported`] if any entry uses a compression method whose
+    /// crate feature is disabled (e.g. a Deflate entry when built without `deflate`).
+    /// With `default-features = false` this means every entry must be Stored (uncompressed).
+    ///
+    /// Returns [`ErrorKind::InvalidData`] if the archive cannot be parsed.
+    pub async fn new(factory: T) -> Result<ZipFS<T>> {
+        #[allow(deprecated)]
+        let zip = ZipFileReader::new(BufReader::new(factory.get().await).compat())
             .await
-            .unwrap();
+            .map_err(zip_error_to_io)?;
 
         // This makes a copy of each entry, but that's probably ok
         let entries = zip
             .file()
             .entries()
-            .into_iter()
+            .iter()
             .map(|e| e.deref().clone())
             .collect();
 
-        Self {
+        Ok(Self {
             factory,
             zip_info: zip.file().clone(),
             entries,
+        })
+    }
+}
+
+/// Converts an error from `async_zip` into an `std::io::Error`.
+///
+/// I/O errors from the underlying reader are passed through unchanged so callers keep their
+/// original `ErrorKind` (e.g. `NotFound` or `PermissionDenied` from a custom [`GetReader`]).
+fn zip_error_to_io(err: async_zip::error::ZipError) -> std::io::Error {
+    use async_zip::error::ZipError;
+
+    match err {
+        ZipError::UpstreamReadError(err) => err,
+        ZipError::CompressionNotSupported(method) => {
+            let (name, feature) = match method {
+                8 => ("Deflate", Some("deflate")),
+                93 => ("Zstandard", Some("zstd")),
+                _ => ("an unsupported method", None),
+            };
+            let hint = match feature {
+                Some(feature) => format!("enable the `{feature}` feature of zipfs"),
+                None => "zipfs cannot read this method".to_string(),
+            };
+            std::io::Error::new(
+                ErrorKind::Unsupported,
+                format!("zip archive contains an entry compressed with {name} (method {method}); {hint}, or repack the archive with stored (uncompressed) entries"),
+            )
         }
+        other => std::io::Error::new(ErrorKind::InvalidData, other),
     }
 }
 
@@ -97,11 +139,13 @@ where
 pub struct File<R> {
     entry: ZipEntry,
 
+    /// Opens the entry reader on first read; `None` once it has completed.
     #[cfg(not(target_family = "wasm"))]
-    loader: Pin<Box<dyn Future<Output = R> + Send + Sync>>,
+    loader: Option<Pin<Box<dyn Future<Output = Result<R>> + Send + Sync>>>,
 
+    /// Opens the entry reader on first read; `None` once it has completed.
     #[cfg(target_family = "wasm")]
-    loader: Pin<Box<dyn Future<Output = R>>>,
+    loader: Option<Pin<Box<dyn Future<Output = Result<R>>>>>,
 
     #[pin]
     inner: Option<R>,
@@ -119,8 +163,19 @@ where
     ) -> std::task::Poll<std::io::Result<()>> {
         // Lazy load the reader
         if self.inner.is_none() {
-            match self.loader.as_mut().poll(cx) {
-                Poll::Ready(r) => self.inner = Some(r),
+            let Some(loader) = self.loader.as_mut() else {
+                // The loader already failed; its error was returned by an earlier read.
+                return Poll::Ready(Err(std::io::Error::other("zip entry could not be opened")));
+            };
+            match loader.as_mut().poll(cx) {
+                Poll::Ready(Ok(r)) => {
+                    self.loader = None;
+                    self.inner = Some(r);
+                }
+                Poll::Ready(Err(err)) => {
+                    self.loader = None;
+                    return Poll::Ready(Err(err));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -210,7 +265,7 @@ impl<T> HasFileType for ZipFS<T>
 where
     T: GetReader + 'static,
 {
-    type FileType = File<Compat<ZipEntryReader<'static, Compat<T::R>, WithoutEntry>>>;
+    type FileType = File<Compat<ZipEntryReader<'static, Compat<BufReader<T::R>>, WithoutEntry>>>;
 }
 
 impl<T> ZipFS<T>
@@ -247,15 +302,19 @@ where
         };
 
         // Create a new ZipFileReader
-        let zip =
-            ZipFileReader::from_raw_parts(self.factory.get().await.compat(), self.zip_info.clone());
+        #[allow(deprecated)]
+        let zip = ZipFileReader::from_raw_parts(
+            BufReader::new(self.factory.get().await).compat(),
+            self.zip_info.clone(),
+        );
 
         Ok(File {
             inner: None,
-            loader: Box::pin(async move {
+            loader: Some(Box::pin(async move {
                 // Turn it into an entry reader
-                zip.into_entry(entry_idx).await.unwrap().compat()
-            }),
+                let reader = zip.into_entry(entry_idx).await.map_err(zip_error_to_io)?;
+                Ok(reader.compat())
+            })),
             entry: entry.clone(),
         })
     }
@@ -458,7 +517,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_symlink() {
-        let zip = ZipFS::new(get_test_data_dir().join("external_symlink.zip")).await;
+        let zip = ZipFS::new(get_test_data_dir().join("external_symlink.zip"))
+            .await
+            .unwrap();
 
         assert!(zip.read_link("/symlink_to_etc_passwd").await.is_err());
         assert!(zip.open("/symlink_to_etc_passwd").await.is_err())
@@ -475,9 +536,13 @@ mod tests {
         str
     }
 
+    // `symlink_test.zip` contains Deflate-compressed files.
+    #[cfg(feature = "deflate")]
     #[tokio::test]
     async fn test_symlinks() {
-        let zip = ZipFS::new(get_test_data_dir().join("symlink_test.zip")).await;
+        let zip = ZipFS::new(get_test_data_dir().join("symlink_test.zip"))
+            .await
+            .unwrap();
 
         assert!(zip.metadata("a/a.txt").await.unwrap().is_file());
         assert!(zip.symlink_metadata("a/a.txt").await.unwrap().is_file());
@@ -518,5 +583,106 @@ mod tests {
         assert_eq!(read_file(&zip, "b/symlink_to_d.txt").await, "d");
         assert_eq!(read_file(&zip, "symlink_to_d.txt").await, "d");
         assert_eq!(read_file(&zip, "/symlink_to_d.txt").await, "d");
+    }
+
+    #[tokio::test]
+    async fn test_stored_only() {
+        let zip = ZipFS::new(get_test_data_dir().join("stored_only.zip"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_file(&zip, "readme.txt").await,
+            "hello from a stored zip\n"
+        );
+        assert!(zip.metadata("images").await.unwrap().is_dir());
+
+        let sprite = zip.read("images/sprite.png").await.unwrap();
+        assert!(sprite.starts_with(b"\x89PNG"));
+        assert_eq!(sprite.len(), 24);
+    }
+
+    #[cfg(not(feature = "deflate"))]
+    #[tokio::test]
+    async fn test_compressed_archive_rejected_without_deflate() {
+        let err = match ZipFS::new(get_test_data_dir().join("symlink_test.zip")).await {
+            Ok(_) => panic!("archive with Deflate entries must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("`deflate` feature"), "{err}");
+    }
+
+    /// A reader whose reads always fail, to check that I/O errors keep their kind.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for FailingReader {
+        fn start_seek(
+            self: std::pin::Pin<&mut Self>,
+            _position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<u64>> {
+            std::task::Poll::Ready(Ok(0))
+        }
+    }
+
+    struct FailingSource;
+
+    #[async_trait::async_trait]
+    impl crate::GetReader for FailingSource {
+        type R = FailingReader;
+
+        async fn get(&self) -> Self::R {
+            FailingReader
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_io_errors_keep_their_kind() {
+        let err = match ZipFS::new(FailingSource).await {
+            Ok(_) => panic!("opening must fail when every read fails"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_entry_open_errors_are_returned() {
+        // Central directory intact, first local header signature corrupted.
+        let zip = ZipFS::new(get_test_data_dir().join("corrupt_local_header.zip"))
+            .await
+            .unwrap();
+
+        let err = zip.read("readme.txt").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+
+        // Reading the same file again after the failure must error, not panic.
+        let mut file = zip.open("readme.txt").await.unwrap();
+        let mut buf = Vec::new();
+        assert!(file.read_to_end(&mut buf).await.is_err());
+        assert!(file.read_to_end(&mut buf).await.is_err());
+
+        // Other entries are unaffected.
+        assert!(zip.read("images/sprite.png").await.is_ok());
     }
 }
