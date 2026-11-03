@@ -195,6 +195,29 @@ fn inflate(
     }
 }
 
+/// Upper bound for the up-front allocation when streaming an entry, so a forged size in the
+/// central directory cannot trigger a huge allocation before any data has been read.
+const MAX_PREALLOCATION: u64 = 16 * 1024 * 1024;
+
+/// Decompresses a whole entry, in one call when its declared size is at most `one_shot_limit`
+/// and plausible, and through the streaming [`EntryReader`] otherwise; size and CRC-32 are
+/// verified either way.
+pub(crate) fn decompress(
+    raw: &[u8],
+    method: Method,
+    uncompressed_size: u64,
+    crc32: u32,
+    one_shot_limit: u64,
+) -> io::Result<Vec<u8>> {
+    if uncompressed_size <= one_shot_limit && fits_one_shot(raw.len() as u64, uncompressed_size) {
+        return decompress_to_vec(raw, method, uncompressed_size, crc32);
+    }
+    let capacity = uncompressed_size.min(MAX_PREALLOCATION) as usize;
+    let mut out = Vec::with_capacity(capacity);
+    EntryReader::new(raw, method, uncompressed_size, crc32)?.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 /// Deflate cannot expand data by more than about 1032:1. Declared sizes beyond that are
 /// impossible for Deflate and implausible in general, so they are not allocated up front.
 const MAX_ONE_SHOT_RATIO: u64 = 1032;

@@ -1,17 +1,13 @@
 //! Indexed, synchronous access to a zip archive held in memory.
 
 use std::borrow::Cow;
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind};
 use std::ops::Range;
 use std::time::SystemTime;
 
 use crate::format::{self, EntryKind, Method, ZipSlice};
 use crate::paths::{self, normalize};
 use crate::reader::{self, EntryReader};
-
-/// Upper bound for the up-front allocation when decompressing an entry, so a forged size in the
-/// central directory cannot trigger a huge allocation before any data has been read.
-const MAX_PREALLOCATION: u64 = 16 * 1024 * 1024;
 
 /// A zip archive held in memory, with an index for fast lookups.
 ///
@@ -58,6 +54,17 @@ struct IndexedEntry {
     local_header_offset: u64,
     modified: Option<SystemTime>,
     unix_mode: Option<u32>,
+}
+
+/// Where a file's (possibly compressed) contents live in the archive data.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+pub(crate) struct FileLocation {
+    pub(crate) range: Range<usize>,
+    pub(crate) method: Method,
+    pub(crate) uncompressed_size: u64,
+    pub(crate) crc32: u32,
+    pub(crate) metadata: Metadata,
 }
 
 /// Metadata of a file, directory or symlink in the archive.
@@ -445,22 +452,35 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
         if entry.method == Method::Stored {
             return Ok(Cow::Borrowed(raw));
         }
-        if entry.uncompressed_size <= self.one_shot_limit
-            && reader::fits_one_shot(entry.compressed_size, entry.uncompressed_size)
-        {
-            return reader::decompress_to_vec(
-                raw,
-                entry.method,
-                entry.uncompressed_size,
-                entry.crc32,
-            )
-            .map(Cow::Owned);
-        }
-        let capacity = entry.uncompressed_size.min(MAX_PREALLOCATION) as usize;
-        let mut out = Vec::with_capacity(capacity);
-        EntryReader::new(raw, entry.method, entry.uncompressed_size, entry.crc32)?
-            .read_to_end(&mut out)?;
-        Ok(Cow::Owned(out))
+        reader::decompress(
+            raw,
+            entry.method,
+            entry.uncompressed_size,
+            entry.crc32,
+            self.one_shot_limit,
+        )
+        .map(Cow::Owned)
+    }
+
+    /// Resolves `path` to a file and returns where its contents live in the archive data, for
+    /// readers that keep their own handle to the data (such as `ZipFS` files).
+    #[cfg_attr(not(feature = "lunchbox"), allow(dead_code))]
+    pub(crate) fn locate_file(&self, path: &str) -> io::Result<FileLocation> {
+        let entry = self.resolve_file(path)?;
+        let range = format::data_range(
+            self.data.as_ref(),
+            entry.local_header_offset,
+            entry.compressed_size,
+            entry.method,
+            entry.uncompressed_size,
+        )?;
+        Ok(FileLocation {
+            range,
+            method: entry.method,
+            uncompressed_size: entry.uncompressed_size,
+            crc32: entry.crc32,
+            metadata: self.entry_metadata(entry),
+        })
     }
 }
 
