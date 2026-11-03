@@ -17,6 +17,9 @@
 // Porting to `read1` is a larger change (different entry types), so it is deferred.
 #![allow(deprecated)]
 
+#[cfg(feature = "sync")]
+pub mod sync;
+
 use async_trait::async_trait;
 use async_zip::base::read::seek::ZipFileReader;
 use async_zip::base::read::{WithoutEntry, ZipEntryReader};
