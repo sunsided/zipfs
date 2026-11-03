@@ -42,6 +42,9 @@ pub struct ZipArchive<D> {
     sorted: Vec<usize>,
     /// Normalized paths of all entries, concatenated; `IndexedEntry::name` indexes into it.
     names: String,
+    /// Largest uncompressed size that `read` decompresses in one call; see
+    /// [`ZipArchive::with_one_shot_limit`].
+    one_shot_limit: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +157,33 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
             entries,
             sorted: deduplicated,
             names,
+            one_shot_limit: u64::MAX,
         })
+    }
+
+    /// Sets the largest file, in uncompressed bytes, that [`read`](Self::read) decompresses in
+    /// one call. `0` turns one-shot decompression off.
+    ///
+    /// One-shot decompression allocates the file's declared size up front and decodes into it
+    /// in a single call. It is usually the faster path and also the leaner one: the result
+    /// needs exactly the file size, whereas the streaming path grows its buffer as output
+    /// arrives, which can briefly need about twice the file size. Its cost is that the declared
+    /// size is reserved before any data has been decoded. Lower the limit when archives may
+    /// carry forged sizes, or on targets where reserving memory commits it (such as
+    /// WebAssembly). Independently of the limit, one-shot decoding is only used up to 1032
+    /// times the compressed size, the most Deflate can expand data.
+    ///
+    /// To keep memory low with large or many files, read them with [`open`](Self::open), which
+    /// always streams and holds only the decoder's working set. The default is no limit.
+    #[must_use]
+    pub fn with_one_shot_limit(mut self, max_size: u64) -> Self {
+        self.one_shot_limit = max_size;
+        self
+    }
+
+    /// The current one-shot limit; see [`with_one_shot_limit`](Self::with_one_shot_limit).
+    pub fn one_shot_limit(&self) -> u64 {
+        self.one_shot_limit
     }
 
     /// The archive bytes.
@@ -416,7 +445,9 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
         if entry.method == Method::Stored {
             return Ok(Cow::Borrowed(raw));
         }
-        if reader::fits_one_shot(entry.compressed_size, entry.uncompressed_size) {
+        if entry.uncompressed_size <= self.one_shot_limit
+            && reader::fits_one_shot(entry.compressed_size, entry.uncompressed_size)
+        {
             return reader::decompress_to_vec(
                 raw,
                 entry.method,
