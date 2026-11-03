@@ -27,7 +27,7 @@ use lunchbox::types::{
     DirEntry, FileType, HasFileType, MaybeSend, MaybeSync, Metadata, Permissions, ReadDir,
     ReadDirPoller, ReadableFile,
 };
-use lunchbox::{types::PathType, ReadableFileSystem};
+use lunchbox::{ReadableFileSystem, types::PathType};
 use pin_project::pin_project;
 use std::collections::HashSet;
 use std::future::Future;
@@ -125,7 +125,9 @@ fn zip_error_to_io(err: async_zip::error::ZipError) -> std::io::Error {
             };
             std::io::Error::new(
                 ErrorKind::Unsupported,
-                format!("zip archive contains an entry compressed with {name} (method {method}); {hint}, or repack the archive with stored (uncompressed) entries"),
+                format!(
+                    "zip archive contains an entry compressed with {name} (method {method}); {hint}, or repack the archive with stored (uncompressed) entries"
+                ),
             )
         }
         other => std::io::Error::new(ErrorKind::InvalidData, other),
@@ -297,7 +299,7 @@ where
                 return Err(std::io::Error::new(
                     ErrorKind::NotFound,
                     format!("File not found in zipfile: {path}"),
-                ))
+                ));
             }
         };
 
@@ -504,7 +506,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use lunchbox::{types::PathType, ReadableFileSystem};
+    use lunchbox::{ReadableFileSystem, types::PathType};
     use tokio::io::AsyncReadExt;
 
     use crate::ZipFS;

@@ -1,7 +1,8 @@
 [package]
 name = "zipfs"
 version = "0.0.2"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 authors = ["Vivek Panyam <hello@vivekpanyam.com>"]
 description = "An async filesystem on top of Zip files."
 license = "Apache-2.0"
