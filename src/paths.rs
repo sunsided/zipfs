@@ -40,6 +40,38 @@ pub(crate) fn normalize(path: &str) -> Option<Cow<'_, str>> {
     Some(Cow::Owned(components.join("/")))
 }
 
+/// Normalizes an entry name read from an archive.
+///
+/// Backslashes are treated as separators, as some older Windows tools wrote them. Names that are
+/// not portable relative paths yield `None`: names containing NUL, names starting with a drive
+/// letter (`C:`), and names that climb above the archive root. Callers that hand entry names to
+/// a host file system can therefore rely on them staying inside a directory.
+pub(crate) fn normalize_entry_name(name: &str) -> Option<Cow<'_, str>> {
+    if !is_portable(name) {
+        return None;
+    }
+    if name.contains('\\') {
+        Some(Cow::Owned(
+            normalize(&name.replace('\\', "/"))?.into_owned(),
+        ))
+    } else {
+        normalize(name)
+    }
+}
+
+/// Rejects NUL bytes and a leading drive letter (`C:`, `C:\\`, `/C:/` after separators).
+fn is_portable(name: &str) -> bool {
+    if name.contains('\0') {
+        return false;
+    }
+    let first = name
+        .split(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or_default()
+        .as_bytes();
+    !(first.len() >= 2 && first[0].is_ascii_alphabetic() && first[1] == b':')
+}
+
 /// Checks a symlink's declared target size before its contents are read.
 pub(crate) fn check_link_target_size(link_path: &str, size: u64) -> io::Result<()> {
     if size > MAX_SYMLINK_TARGET as u64 {
@@ -57,19 +89,21 @@ pub(crate) fn check_link_target_size(link_path: &str, size: u64) -> io::Result<(
 pub(crate) fn resolve_link(link_path: &str, target: &[u8]) -> io::Result<String> {
     let target = std::str::from_utf8(target)
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "symlink target is not UTF-8"))?;
-    if target.starts_with('/') {
+    if target.starts_with(['/', '\\']) || !is_portable(target) {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "absolute symlink targets are not supported",
+            "symlink target is absolute or not a portable path",
         ));
     }
     let joined = format!("{}/{target}", parent(link_path));
-    normalize(&joined).map(Cow::into_owned).ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidInput,
-            "symlink target points outside the archive",
-        )
-    })
+    normalize_entry_name(&joined)
+        .map(Cow::into_owned)
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "symlink target points outside the archive",
+            )
+        })
 }
 
 pub(crate) fn too_many_links() -> io::Error {
@@ -113,6 +147,41 @@ mod tests {
         assert_eq!(normalize(".."), None);
         assert_eq!(normalize("a/../../b"), None);
         assert_eq!(normalize("/../etc/passwd"), None);
+    }
+
+    #[test]
+    fn entry_names_must_be_portable() {
+        assert_eq!(normalize_entry_name("a\\b\\c.txt").unwrap(), "a/b/c.txt");
+        assert_eq!(normalize_entry_name("a/./b.txt").unwrap(), "a/b.txt");
+        assert_eq!(normalize_entry_name("..\\..\\evil"), None);
+        assert_eq!(normalize_entry_name("C:\\Windows\\evil.dll"), None);
+        assert_eq!(normalize_entry_name("/c:/evil"), None);
+        assert_eq!(normalize_entry_name("a\0b"), None);
+        // A colon elsewhere is an ordinary character.
+        assert_eq!(
+            normalize_entry_name("logs/12:00.txt").unwrap(),
+            "logs/12:00.txt"
+        );
+    }
+
+    #[test]
+    fn link_targets_must_be_portable_and_relative() {
+        assert_eq!(resolve_link("dir/link", b"../a.txt").unwrap(), "a.txt");
+        assert_eq!(resolve_link("dir/link", b"..\\a.txt").unwrap(), "a.txt");
+        for target in [
+            &b"/etc/passwd"[..],
+            b"\\server\\share",
+            b"C:/x",
+            b"a\0b",
+            b"../../x",
+        ] {
+            assert_eq!(
+                resolve_link("dir/link", target).unwrap_err().kind(),
+                ErrorKind::InvalidInput,
+                "{}",
+                String::from_utf8_lossy(target)
+            );
+        }
     }
 
     #[test]

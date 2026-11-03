@@ -519,6 +519,45 @@ fn names_escaping_the_root_are_rejected() {
 }
 
 #[test]
+fn backslash_names_are_normalized() {
+    // Older Windows tools wrote backslash separators.
+    let bytes = build(&[Hand::file(b"assets\\images\\a.png", b"png")], b"");
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(&*zip.read("assets/images/a.png").unwrap(), b"png");
+    assert_eq!(names(&zip.read_dir("assets").unwrap()), ["images"]);
+    assert_eq!(
+        ZipSlice::new(&bytes)
+            .unwrap()
+            .get("assets/images/a.png")
+            .unwrap(),
+        b"png"
+    );
+}
+
+#[test]
+fn non_portable_names_are_rejected() {
+    for name in [
+        &b"..\\..\\evil.dll"[..],
+        b"C:\\Windows\\evil.dll",
+        b"c:/evil",
+        b"a\0b.txt",
+    ] {
+        let bytes = build(&[Hand::file(name, b"x")], b"");
+        let err = ZipArchive::new(&bytes[..]).err().expect("must be rejected");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidData,
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+        // The raw view lists the entry, but no lookup reaches it.
+        let slice = ZipSlice::new(&bytes).unwrap();
+        assert_eq!(slice.entries().count(), 1);
+        assert!(slice.find("evil.dll").unwrap().is_none());
+    }
+}
+
+#[test]
 fn encrypted_entries_are_rejected() {
     let mut entry = Hand::file(b"secret.txt", b"x");
     entry.flags = 1;

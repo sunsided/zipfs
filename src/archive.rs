@@ -97,8 +97,10 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
         for entry in slice.entries() {
             let entry = entry?;
             let raw_name = entry.name()?;
-            let path = normalize(&raw_name).ok_or_else(|| {
-                format::invalid(&format!("entry name escapes the archive root: {raw_name}"))
+            let path = paths::normalize_entry_name(&raw_name).ok_or_else(|| {
+                format::invalid(&format!(
+                    "entry name is not a portable relative path (NUL, drive letter or escapes the archive root): {raw_name:?}"
+                ))
             })?;
             if path.is_empty() {
                 // An entry for the root directory itself (`/` or `./`).

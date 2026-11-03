@@ -230,7 +230,7 @@ impl<'a> ZipSlice<'a> {
         let mut found = None;
         for entry in self.entries() {
             let entry = entry?;
-            if normalize(&entry.name()?).is_some_and(|name| name == key) {
+            if paths::normalize_entry_name(&entry.name()?).is_some_and(|name| name == key) {
                 found = Some(entry);
             }
         }
@@ -303,7 +303,7 @@ impl<'a> ZipSlice<'a> {
     fn has_children(&self, dir: &str) -> io::Result<bool> {
         for entry in self.entries() {
             let name = entry?.name()?;
-            if let Some(name) = normalize(&name) {
+            if let Some(name) = paths::normalize_entry_name(&name) {
                 if name.len() > dir.len()
                     && name.starts_with(dir)
                     && (dir.is_empty() || name.as_bytes()[dir.len()] == b'/')
