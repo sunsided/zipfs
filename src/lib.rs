@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
+// The `read::seek` module is deprecated in async_zip 0.0.19 in favour of `read1`.
+// Porting to `read1` is a larger change (different entry types), so it is deferred.
+#![allow(deprecated)]
 
 use async_trait::async_trait;
 use async_zip::base::read::seek::ZipFileReader;
@@ -31,7 +34,7 @@ use std::io::{ErrorKind, Result};
 use std::ops::Deref;
 use std::pin::Pin;
 use std::task::Poll;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, BufReader};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 /// In order to open and read multiple files simultaneously, we need multiple AsyncRead + AsyncSeek streams for the
@@ -70,7 +73,7 @@ where
     T: GetReader,
 {
     pub async fn new(factory: T) -> ZipFS<T> {
-        let zip = ZipFileReader::new(factory.get().await.compat())
+        let zip = ZipFileReader::new(BufReader::new(factory.get().await).compat())
             .await
             .unwrap();
 
@@ -210,7 +213,7 @@ impl<T> HasFileType for ZipFS<T>
 where
     T: GetReader + 'static,
 {
-    type FileType = File<Compat<ZipEntryReader<'static, Compat<T::R>, WithoutEntry>>>;
+    type FileType = File<Compat<ZipEntryReader<'static, Compat<BufReader<T::R>>, WithoutEntry>>>;
 }
 
 impl<T> ZipFS<T>
@@ -247,8 +250,10 @@ where
         };
 
         // Create a new ZipFileReader
-        let zip =
-            ZipFileReader::from_raw_parts(self.factory.get().await.compat(), self.zip_info.clone());
+        let zip = ZipFileReader::from_raw_parts(
+            BufReader::new(self.factory.get().await).compat(),
+            self.zip_info.clone(),
+        );
 
         Ok(File {
             inner: None,
