@@ -220,14 +220,14 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
 
     /// Returns metadata, following symlinks.
     pub fn metadata(&self, path: &str) -> io::Result<Metadata> {
-        let path = self.canonicalize(path)?;
-        self.metadata_no_follow(&path)
+        let (path, entry) = self.resolve(path)?;
+        self.metadata_for(&path, entry)
     }
 
     /// Returns metadata without following a symlink in the final path component.
     pub fn symlink_metadata(&self, path: &str) -> io::Result<Metadata> {
         let path = normalize(path).ok_or_else(|| not_found(path))?;
-        self.metadata_no_follow(&path)
+        self.metadata_for(&path, self.find(&path))
     }
 
     /// Returns the target of a symlink as a normalized path from the archive root.
@@ -244,13 +244,22 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     ///
     /// Paths that do not exist are returned normalized but otherwise unchanged.
     pub fn canonicalize(&self, path: &str) -> io::Result<String> {
-        let mut path = normalize(path).ok_or_else(|| not_found(path))?.into_owned();
+        Ok(self.resolve(path)?.0.into_owned())
+    }
+
+    /// Normalizes `path` and follows symlinks in its final component, returning the resolved
+    /// path and its entry (`None` for implicit directories and paths that do not exist).
+    ///
+    /// The path stays borrowed unless normalization or a symlink changed it, so lookups of
+    /// plain paths do not allocate.
+    fn resolve<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Option<&IndexedEntry>)> {
+        let mut current = normalize(path).ok_or_else(|| not_found(path))?;
         for _ in 0..paths::MAX_SYMLINK_HOPS {
-            match self.find(&path) {
+            match self.find(&current) {
                 Some(entry) if entry.kind == EntryKind::Symlink => {
-                    path = self.link_target(&path, entry)?;
+                    current = Cow::Owned(self.link_target(&current, entry)?);
                 }
-                _ => return Ok(path),
+                entry => return Ok((current, entry)),
             }
         }
         Err(paths::too_many_links())
@@ -321,18 +330,25 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     }
 
     fn is_dir(&self, normalized: &str) -> bool {
-        if normalized.is_empty() {
-            return true;
-        }
-        if let Some(entry) = self.find(normalized) {
-            if entry.kind == EntryKind::Directory {
-                return true;
-            }
-        }
-        let prefix = format!("{normalized}/");
-        self.sorted
-            .get(self.lower_bound(&prefix))
-            .is_some_and(|&index| self.name(index).starts_with(&prefix))
+        normalized.is_empty()
+            || self
+                .find(normalized)
+                .is_some_and(|entry| entry.kind == EntryKind::Directory)
+            || self.has_children(normalized)
+    }
+
+    /// Whether any entry lies below the normalized, non-empty directory path `dir`.
+    ///
+    /// Compares against `dir` followed by `/` without building that string.
+    fn has_children(&self, dir: &str) -> bool {
+        let key = || dir.bytes().chain(std::iter::once(b'/'));
+        let start = self
+            .sorted
+            .partition_point(|&index| self.name(index).bytes().lt(key()));
+        self.sorted.get(start).is_some_and(|&index| {
+            let name = self.name(index).as_bytes();
+            name.len() > dir.len() && name.starts_with(dir.as_bytes()) && name[dir.len()] == b'/'
+        })
     }
 
     fn entry_metadata(&self, entry: &IndexedEntry) -> Metadata {
@@ -346,11 +362,12 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
         }
     }
 
-    fn metadata_no_follow(&self, normalized: &str) -> io::Result<Metadata> {
-        if let Some(entry) = self.find(normalized) {
+    /// Metadata for a normalized path whose entry (if any) has already been looked up.
+    fn metadata_for(&self, normalized: &str, entry: Option<&IndexedEntry>) -> io::Result<Metadata> {
+        if let Some(entry) = entry {
             return Ok(self.entry_metadata(entry));
         }
-        if self.is_dir(normalized) {
+        if normalized.is_empty() || self.has_children(normalized) {
             return Ok(Metadata {
                 kind: EntryKind::Directory,
                 len: 0,
@@ -364,8 +381,8 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
     }
 
     fn resolve_file(&self, path: &str) -> io::Result<&IndexedEntry> {
-        let path = self.canonicalize(path)?;
-        match self.find(&path) {
+        let (path, entry) = self.resolve(path)?;
+        match entry {
             Some(entry) if entry.kind == EntryKind::File => Ok(entry),
             Some(_) => Err(is_a_directory(&path)),
             None if self.is_dir(&path) => Err(is_a_directory(&path)),
