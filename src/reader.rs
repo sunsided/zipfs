@@ -195,6 +195,93 @@ fn inflate(
     }
 }
 
+/// Deflate cannot expand data by more than about 1032:1. Declared sizes beyond that are
+/// impossible for Deflate and implausible in general, so they are not allocated up front.
+const MAX_ONE_SHOT_RATIO: u64 = 1032;
+
+/// Whether an entry is small enough relative to its compressed size to be decompressed in one
+/// call into a buffer of its declared size.
+///
+/// One-shot decoding allocates the declared size before reading any data, so a forged size
+/// must not cause a large allocation (on wasm, memory growth is committed). Entries above the
+/// bound are read with the streaming [`EntryReader`], which grows its buffer with the output.
+pub(crate) fn fits_one_shot(compressed_size: u64, uncompressed_size: u64) -> bool {
+    uncompressed_size <= compressed_size.saturating_mul(MAX_ONE_SHOT_RATIO)
+}
+
+/// Decompresses a whole entry in one call into a buffer of exactly its declared size, then
+/// verifies the size and CRC-32.
+///
+/// The buffer size doubles as the output cap: a stream that would produce more fails. Errors
+/// match [`EntryReader`]: [`ErrorKind::InvalidData`] for corrupt data, excess output or a
+/// checksum mismatch, [`ErrorKind::UnexpectedEof`] for truncated data.
+pub(crate) fn decompress_to_vec(
+    raw: &[u8],
+    method: Method,
+    uncompressed_size: u64,
+    crc32: u32,
+) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(uncompressed_size).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "zip entry is too large for this platform",
+        )
+    })?;
+    let mut out = vec![0u8; len];
+    let written = match method {
+        #[cfg(feature = "deflate")]
+        Method::Deflate => {
+            use miniz_oxide::inflate::TINFLStatus;
+            miniz_oxide::inflate::decompress_slice_iter_to_slice(
+                &mut out,
+                std::iter::once(raw),
+                false,
+                true,
+            )
+            .map_err(|status| match status {
+                TINFLStatus::HasMoreOutput => io::Error::new(
+                    ErrorKind::InvalidData,
+                    "zip entry decompresses to more than its declared size",
+                ),
+                TINFLStatus::FailedCannotMakeProgress => {
+                    io::Error::new(ErrorKind::UnexpectedEof, "deflate stream is truncated")
+                }
+                _ => io::Error::new(ErrorKind::InvalidData, "corrupt deflate stream"),
+            })?
+        }
+        #[cfg(feature = "zstd")]
+        Method::Zstd => ruzstd::decoding::FrameDecoder::new()
+            .decode_all(raw, &mut out)
+            .map_err(|err| {
+                io::Error::new(ErrorKind::InvalidData, format!("invalid zstd data: {err}"))
+            })?,
+        Method::Stored => {
+            if raw.len() != len {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "stored entry size does not match its declared size",
+                ));
+            }
+            out.copy_from_slice(raw);
+            len
+        }
+        other => return Err(unsupported_method(other)),
+    };
+    if written != len {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "zip entry ended before its declared size",
+        ));
+    }
+    if crate::crc32::checksum(&out) != crc32 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "zip entry CRC-32 mismatch",
+        ));
+    }
+    Ok(out)
+}
+
 pub(crate) fn unsupported_method(method: Method) -> io::Error {
     let hint = match method {
         Method::Deflate => "enable the `deflate` feature of zipfs".to_string(),

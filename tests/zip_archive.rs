@@ -646,6 +646,25 @@ fn truncated_deflate_streams_are_rejected() {
     assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
 }
 
+/// Declared sizes beyond Deflate's maximum ratio are not allocated up front; they take the
+/// streaming path, which still reports the truncation.
+#[cfg(feature = "deflate")]
+#[test]
+fn implausible_declared_sizes_use_the_streaming_path() {
+    let payload = b"short";
+    let deflated: &'static [u8] = deflate_stored_block(payload, true).leak();
+    let mut entry = Hand::file(b"huge", deflated);
+    entry.method = 8;
+    entry.crc = Some(crc32(payload));
+    // 1 GiB from a 10-byte stream: far beyond any possible deflate expansion.
+    entry.uncompressed_size = Some(1 << 30);
+    let bytes = build(&[entry], b"");
+
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    let err = zip.read("huge").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
+}
+
 #[test]
 fn encrypted_entries_are_rejected() {
     let mut entry = Hand::file(b"secret.txt", b"x");

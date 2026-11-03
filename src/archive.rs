@@ -399,6 +399,15 @@ impl<D: AsRef<[u8]>> ZipArchive<D> {
         if entry.method == Method::Stored {
             return Ok(Cow::Borrowed(raw));
         }
+        if reader::fits_one_shot(entry.compressed_size, entry.uncompressed_size) {
+            return reader::decompress_to_vec(
+                raw,
+                entry.method,
+                entry.uncompressed_size,
+                entry.crc32,
+            )
+            .map(Cow::Owned);
+        }
         let capacity = entry.uncompressed_size.min(MAX_PREALLOCATION) as usize;
         let mut out = Vec::with_capacity(capacity);
         EntryReader::new(raw, entry.method, entry.uncompressed_size, entry.crc32)?
