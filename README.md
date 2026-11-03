@@ -39,6 +39,10 @@ async fn load() -> std::io::Result<()> {
 | `deflate` | yes     | Reading Deflate entries (what most zip tools produce)    |
 | `zstd`    | yes     | Reading Zstandard entries (builds the C `zstd` library)  |
 
+The `zstd` feature compiles C code. On `wasm32-wasip1` this needs a WASI C toolchain
+([wasi-sdk](https://github.com/WebAssembly/wasi-sdk)); without one, build with
+`default-features = false, features = ["deflate"]`.
+
 To use zip files as plain, uncompressed containers, disable the default features:
 
 ```toml
