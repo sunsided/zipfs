@@ -43,33 +43,31 @@ pub(crate) fn normalize(path: &str) -> Option<Cow<'_, str>> {
 /// Normalizes an entry name read from an archive.
 ///
 /// Backslashes are treated as separators, as some older Windows tools wrote them. Names that are
-/// not portable relative paths yield `None`: names containing NUL, names starting with a drive
-/// letter (`C:`), and names that climb above the archive root. Callers that hand entry names to
-/// a host file system can therefore rely on them staying inside a directory.
+/// not portable relative paths yield `None`: names containing NUL, names with a component that
+/// starts with a drive letter (`C:`) after normalization, and names that climb above the archive
+/// root. Callers that hand entry names to a host file system can therefore rely on them staying
+/// inside a directory.
 pub(crate) fn normalize_entry_name(name: &str) -> Option<Cow<'_, str>> {
-    if !is_portable(name) {
+    if name.contains('\0') {
         return None;
     }
-    if name.contains('\\') {
-        Some(Cow::Owned(
-            normalize(&name.replace('\\', "/"))?.into_owned(),
-        ))
+    let normalized = if name.contains('\\') {
+        Cow::Owned(normalize(&name.replace('\\', "/"))?.into_owned())
     } else {
-        normalize(name)
+        normalize(name)?
+    };
+    // Validate the normalized result: `x/../C:/evil` only shows its drive letter after
+    // normalization.
+    if normalized.split('/').any(is_drive_letter) {
+        return None;
     }
+    Some(normalized)
 }
 
-/// Rejects NUL bytes and a leading drive letter (`C:`, `C:\\`, `/C:/` after separators).
-fn is_portable(name: &str) -> bool {
-    if name.contains('\0') {
-        return false;
-    }
-    let first = name
-        .split(['/', '\\'])
-        .find(|component| !component.is_empty())
-        .unwrap_or_default()
-        .as_bytes();
-    !(first.len() >= 2 && first[0].is_ascii_alphabetic() && first[1] == b':')
+/// Whether a path component starts with a drive letter (`C:`, `c:evil`).
+fn is_drive_letter(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Checks a symlink's declared target size before its contents are read.
@@ -89,7 +87,10 @@ pub(crate) fn check_link_target_size(link_path: &str, size: u64) -> io::Result<(
 pub(crate) fn resolve_link(link_path: &str, target: &[u8]) -> io::Result<String> {
     let target = std::str::from_utf8(target)
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "symlink target is not UTF-8"))?;
-    if target.starts_with(['/', '\\']) || !is_portable(target) {
+    if target.starts_with(['/', '\\'])
+        || target.contains('\0')
+        || target.split(['/', '\\']).any(is_drive_letter)
+    {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             "symlink target is absolute or not a portable path",
@@ -157,6 +158,11 @@ mod tests {
         assert_eq!(normalize_entry_name("C:\\Windows\\evil.dll"), None);
         assert_eq!(normalize_entry_name("/c:/evil"), None);
         assert_eq!(normalize_entry_name("a\0b"), None);
+        // Normalization must not be able to bring a drive letter to the front.
+        assert_eq!(normalize_entry_name("x/../C:/evil"), None);
+        assert_eq!(normalize_entry_name("./C:/evil"), None);
+        assert_eq!(normalize_entry_name("a/..\\C:\\evil"), None);
+        assert_eq!(normalize_entry_name("dir/C:/evil"), None);
         // A colon elsewhere is an ordinary character.
         assert_eq!(
             normalize_entry_name("logs/12:00.txt").unwrap(),

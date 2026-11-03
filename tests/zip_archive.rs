@@ -541,6 +541,8 @@ fn non_portable_names_are_rejected() {
         b"C:\\Windows\\evil.dll",
         b"c:/evil",
         b"a\0b.txt",
+        b"x/../C:/evil.dll",
+        b"a\\..\\c:\\evil.dll",
     ] {
         let bytes = build(&[Hand::file(name, b"x")], b"");
         let err = ZipArchive::new(&bytes[..]).err().expect("must be rejected");
