@@ -227,6 +227,11 @@ impl<'a> ZipSlice<'a> {
         let Some(key) = normalize(path) else {
             return Ok(None);
         };
+        // The archive root is always a directory; entries for it (`/`, `./`) are ignored, as
+        // in `ZipArchive`.
+        if key.is_empty() {
+            return Ok(None);
+        }
         let mut found = None;
         for entry in self.entries() {
             let entry = entry?;

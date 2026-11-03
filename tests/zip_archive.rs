@@ -767,6 +767,25 @@ fn crc_mismatch_fails_the_streaming_reader() {
     assert_eq!(&*zip.read("a.txt").unwrap(), b"payload");
 }
 
+/// An entry for the archive root is ignored, even one marked as a symlink: the root is always a
+/// directory.
+#[test]
+fn root_entries_are_ignored_by_both_readers() {
+    let bytes = build(
+        &[
+            Hand::symlink(b"./", b"elsewhere"),
+            Hand::file(b"a.txt", b"a"),
+        ],
+        b"",
+    );
+    let slice = ZipSlice::new(&bytes).unwrap();
+    assert!(slice.find("").unwrap().is_none());
+    assert_eq!(slice.get("").unwrap_err().kind(), ErrorKind::IsADirectory);
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(zip.metadata("").unwrap().kind, EntryKind::Directory);
+    assert_eq!(names(&zip.read_dir("").unwrap()), ["a.txt"]);
+}
+
 #[test]
 fn verified_stored_reads_catch_crc_mismatches() {
     let mut corrupt = Hand::file(b"dir/corrupt.txt", b"payload");
