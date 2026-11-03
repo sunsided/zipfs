@@ -104,11 +104,15 @@ where
     }
 }
 
-/// Converts an archive-level error from `async_zip` into an `std::io::Error`.
+/// Converts an error from `async_zip` into an `std::io::Error`.
+///
+/// I/O errors from the underlying reader are passed through unchanged so callers keep their
+/// original `ErrorKind` (e.g. `NotFound` or `PermissionDenied` from a custom [`GetReader`]).
 fn zip_error_to_io(err: async_zip::error::ZipError) -> std::io::Error {
     use async_zip::error::ZipError;
 
     match err {
+        ZipError::UpstreamReadError(err) => err,
         ZipError::CompressionNotSupported(method) => {
             let (name, feature) = match method {
                 8 => ("Deflate", Some("deflate")),
@@ -594,5 +598,57 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("`deflate` feature"), "{err}");
+    }
+
+    /// A reader whose reads always fail, to check that I/O errors keep their kind.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for FailingReader {
+        fn start_seek(
+            self: std::pin::Pin<&mut Self>,
+            _position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<u64>> {
+            std::task::Poll::Ready(Ok(0))
+        }
+    }
+
+    struct FailingSource;
+
+    #[async_trait::async_trait]
+    impl crate::GetReader for FailingSource {
+        type R = FailingReader;
+
+        async fn get(&self) -> Self::R {
+            FailingReader
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_io_errors_keep_their_kind() {
+        let err = match ZipFS::new(FailingSource).await {
+            Ok(_) => panic!("opening must fail when every read fails"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 }
