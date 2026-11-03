@@ -11,6 +11,10 @@ cargo-fuzz = true
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 zipfs = { path = "..", default-features = false, features = ["deflate", "zstd"] }
 
+[features]
+# Fuzz path resolution with symlinks followed in every component.
+full-symlinks = ["zipfs/full-symlinks"]
+
 # Keep the fuzz crate out of the zipfs workspace.
 [workspace]
 members = ["."]

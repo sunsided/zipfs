@@ -31,9 +31,26 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     assert_eq!(entries.len(), zip.len());
 
+    // With `full-symlinks`, an entry stored below a symlink (`link/file` next to a `link`
+    // symlink) is shadowed by the link, as on a file system, so it is not reachable by its own
+    // name; zip tools never produce such archives, but crafted ones can.
+    let symlinks: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|(_, metadata)| metadata.kind == EntryKind::Symlink)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let shadowed = |path: &str| {
+        cfg!(feature = "full-symlinks")
+            && path
+                .match_indices('/')
+                .any(|(at, _)| symlinks.contains(&path[..at]))
+    };
+
     for (path, metadata) in &entries {
         common::assert_normalized(path);
-        assert_eq!(&zip.symlink_metadata(path).unwrap(), metadata);
+        if !shadowed(path) {
+            assert_eq!(&zip.symlink_metadata(path).unwrap(), metadata);
+        }
 
         if let Ok(target) = zip.read_link(path) {
             assert_eq!(metadata.kind, EntryKind::Symlink);
