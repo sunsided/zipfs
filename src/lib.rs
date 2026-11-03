@@ -13,11 +13,12 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
-// The `read::seek` module is deprecated in async_zip 0.0.19 in favour of `read1`.
-// Porting to `read1` is a larger change (different entry types), so it is deferred.
-#![allow(deprecated)]
-
 use async_trait::async_trait;
+// async_zip 0.0.19 deprecates the `read::seek` module in favour of `read1`. Porting to `read1` is
+// a larger change (different entry types), so it is deferred. The deprecation is allowed at each
+// of the three uses (this import, `ZipFS::new` and `open_no_follow_symlink`) rather than
+// crate-wide, so other deprecations still warn.
+#[allow(deprecated)]
 use async_zip::base::read::seek::ZipFileReader;
 use async_zip::base::read::{WithoutEntry, ZipEntryReader};
 use async_zip::{AttributeCompatibility, ZipEntry};
@@ -82,6 +83,7 @@ where
     ///
     /// Returns [`ErrorKind::InvalidData`] if the archive cannot be parsed.
     pub async fn new(factory: T) -> Result<ZipFS<T>> {
+        #[allow(deprecated)]
         let zip = ZipFileReader::new(BufReader::new(factory.get().await).compat())
             .await
             .map_err(zip_error_to_io)?;
@@ -283,6 +285,7 @@ where
         };
 
         // Create a new ZipFileReader
+        #[allow(deprecated)]
         let zip = ZipFileReader::from_raw_parts(
             BufReader::new(self.factory.get().await).compat(),
             self.zip_info.clone(),
