@@ -18,7 +18,7 @@ use crate::reader::{self, EntryReader};
 ///
 /// ```
 /// # fn main() -> std::io::Result<()> {
-/// use zipfs::ZipArchive;
+/// use zipfs_ng::ZipArchive;
 ///
 /// static ASSETS: &[u8] = include_bytes!("../test_data/stored_only.zip");
 ///

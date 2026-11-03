@@ -1,9 +1,13 @@
-[<img alt="github" src="https://img.shields.io/badge/github-vivekpanyam/zipfs-8da0cb?style=for-the-badge&logo=github" height="20">](https://github.com/vivekpanyam/zipfs)
-[<img alt="crates.io" src="https://img.shields.io/crates/v/zipfs.svg?style=for-the-badge&logo=rust" height="20">](https://crates.io/crates/zipfs)
-[<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-zipfs-66c2a5?style=for-the-badge&logo=docs.rs" height="20">](https://docs.rs/zipfs)
+[<img alt="github" src="https://img.shields.io/badge/github-sunsided/zipfs-8da0cb?style=for-the-badge&logo=github" height="20">](https://github.com/sunsided/zipfs)
+[<img alt="crates.io" src="https://img.shields.io/crates/v/zipfs-ng.svg?style=for-the-badge&logo=rust" height="20">](https://crates.io/crates/zipfs-ng)
+[<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-zipfs--ng-66c2a5?style=for-the-badge&logo=docs.rs" height="20">](https://docs.rs/zipfs-ng)
 
 Read zip archives held in memory, such as assets embedded with `include_bytes!`, without
 copying stored (uncompressed) files.
+
+zipfs-ng continues [zipfs](https://crates.io/crates/zipfs) 0.0.2 by Vivek Panyam, rewritten
+around its own zip reader. Import it as `zipfs_ng`; see the [changelog](CHANGELOG.md) for what
+changed.
 
 - `ZipArchive<D>` indexes an archive held in any `AsRef<[u8]>` (`&'static [u8]`, `Vec<u8>`,
   `Arc<[u8]>`, a memory map). Stored files are returned borrowed, never copied; compressed files
@@ -22,11 +26,11 @@ Requires Rust 1.87 or newer.
 
 ```toml
 [dependencies]
-zipfs = "0.0.2"
+zipfs-ng = "0.1"
 ```
 
 ```rust
-use zipfs::{ZipArchive, ZipSlice};
+use zipfs_ng::{ZipArchive, ZipSlice};
 
 fn load(assets: &'static [u8]) -> std::io::Result<()> {
     // Indexed lookups; `read` borrows stored files and decompresses the rest.
@@ -53,14 +57,14 @@ copying.
 ```toml
 [dependencies]
 lunchbox = "0.1"
-zipfs = { version = "0.0.2", features = ["lunchbox"] }
+zipfs-ng = { version = "0.1", features = ["lunchbox"] }
 ```
 
 ```rust
 use std::sync::Arc;
 
 use lunchbox::ReadableFileSystem;
-use zipfs::ZipFS;
+use zipfs_ng::ZipFS;
 
 async fn load(assets: &'static [u8]) -> std::io::Result<()> {
     // Embedded bytes, or any cheaply clonable buffer such as `Arc<[u8]>`.
@@ -81,7 +85,7 @@ To read an archive on demand instead of loading it, open it from an `AsyncSource
 
 ```rust
 use lunchbox::ReadableFileSystem;
-use zipfs::{FileSource, Source, ZipFS};
+use zipfs_ng::{FileSource, Source, ZipFS};
 
 async fn load() -> std::io::Result<()> {
     // Fetches the end records and the central directory; files are fetched when read.
@@ -112,10 +116,10 @@ To use zip files as plain, uncompressed containers, disable the default features
 
 ```toml
 [dependencies]
-zipfs = { version = "0.0.2", default-features = false }
+zipfs-ng = { version = "0.1", default-features = false }
 ```
 
 Only stored (uncompressed) entries can then be read, no decompression code is compiled in, and
-zipfs has no dependencies. Opening an archive that contains an entry using a compression method
+zipfs-ng has no dependencies. Opening an archive that contains an entry using a compression method
 whose feature is disabled fails with `std::io::ErrorKind::Unsupported`. Create compatible
 archives with `zip -0 -r assets.zip assets/`.

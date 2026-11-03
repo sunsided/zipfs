@@ -5,7 +5,7 @@
 mod common;
 
 use libfuzzer_sys::fuzz_target;
-use zipfs::{EntryKind, ZipArchive, ZipSlice};
+use zipfs_ng::{EntryKind, ZipArchive, ZipSlice};
 
 /// `ZipSlice` lookups scan the whole central directory; bound the work per input.
 const MAX_ENTRIES: usize = 256;

@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::io::Read;
 
 use libfuzzer_sys::fuzz_target;
-use zipfs::{EntryKind, ZipArchive};
+use zipfs_ng::{EntryKind, ZipArchive};
 
 /// Skip reading entries declared larger than this, to keep iterations fast.
 const MAX_READ: u64 = 16 * 1024 * 1024;

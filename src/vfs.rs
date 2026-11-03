@@ -9,7 +9,7 @@
 //! ```
 //! # async fn example() -> std::io::Result<()> {
 //! use lunchbox::ReadableFileSystem;
-//! use zipfs::ZipFS;
+//! use zipfs_ng::ZipFS;
 //!
 //! static ASSETS: &[u8] = include_bytes!("../test_data/stored_only.zip");
 //!
@@ -154,7 +154,7 @@ impl<S: AsyncSource> ZipFS<Source<S>> {
     /// ```no_run
     /// # async fn example() -> std::io::Result<()> {
     /// use lunchbox::ReadableFileSystem;
-    /// use zipfs::{FileSource, ZipFS};
+    /// use zipfs_ng::{FileSource, ZipFS};
     ///
     /// let fs = ZipFS::from_source(FileSource::open("assets.zip").await?).await?;
     /// let sprite = fs.read("images/sprite.png").await?;

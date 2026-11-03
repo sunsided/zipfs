@@ -11,7 +11,7 @@ use lunchbox::types::ReadableFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
-use zipfs::{AsyncSource, Source, ZipFS};
+use zipfs_ng::{AsyncSource, Source, ZipFS};
 
 /// An archive in memory behind the async source interface, counting what is fetched. Every
 /// read yields to the executor once before completing, so callers must handle pending reads.
@@ -96,8 +96,8 @@ async fn read_in_small_pieces<F: ReadableFile + Unpin>(file: &mut F) -> Vec<u8> 
 
 async fn dir_names<B>(fs: &ZipFS<B>, path: &str) -> io::Result<Vec<String>>
 where
-    B: zipfs::Backend,
-    ZipFS<B>: ReadableFileSystem<ReadDirPollerType = zipfs::ZipReadDirPoller>,
+    B: zipfs_ng::Backend,
+    ZipFS<B>: ReadableFileSystem<ReadDirPollerType = zipfs_ng::ZipReadDirPoller>,
     <ZipFS<B> as lunchbox::types::HasFileType>::FileType: ReadableFile,
 {
     let mut entries = fs.read_dir(path).await?;
@@ -282,7 +282,7 @@ async fn invalid_archives_are_rejected() {
 #[tokio::test]
 async fn file_source_reads_from_disk() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/symlink_test.zip");
-    let fs = ZipFS::from_source(zipfs::FileSource::open(path).await.unwrap())
+    let fs = ZipFS::from_source(zipfs_ng::FileSource::open(path).await.unwrap())
         .await
         .unwrap();
     assert_eq!(fs.read_to_string("b/symlink_to_d.txt").await.unwrap(), "d");
@@ -295,6 +295,6 @@ async fn file_source_reads_from_disk() {
         .unwrap();
     assert_eq!(contents, "a");
 
-    let missing = zipfs::FileSource::open("/definitely/not/here.zip").await;
+    let missing = zipfs_ng::FileSource::open("/definitely/not/here.zip").await;
     assert_eq!(missing.err().unwrap().kind(), io::ErrorKind::NotFound);
 }

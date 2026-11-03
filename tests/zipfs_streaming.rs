@@ -15,7 +15,7 @@ use lunchbox::types::ReadableFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
-use zipfs::ZipFS;
+use zipfs_ng::ZipFS;
 
 struct CountingAllocator;
 

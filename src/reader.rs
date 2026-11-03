@@ -402,8 +402,8 @@ pub(crate) fn decompress_to_vec(
 
 pub(crate) fn unsupported_method(method: Method) -> io::Error {
     let hint = match method {
-        Method::Deflate => "enable the `deflate` feature of zipfs".to_string(),
-        Method::Zstd => "enable the `zstd` feature of zipfs".to_string(),
+        Method::Deflate => "enable the `deflate` feature of zipfs-ng".to_string(),
+        Method::Zstd => "enable the `zstd` feature of zipfs-ng".to_string(),
         other => format!("compression method {} is not supported", other.id()),
     };
     io::Error::new(

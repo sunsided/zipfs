@@ -441,8 +441,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "zipfs"
-version = "0.0.2"
+name = "zipfs-ng"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "crc32fast",
