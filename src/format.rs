@@ -349,21 +349,28 @@ impl<'a> ZipSlice<'a> {
     /// The symlinks of the archive by normalized path, as `find` would see them (the last
     /// entry with a path wins, so a later non-symlink entry hides an earlier symlink).
     ///
-    /// Collected once per resolution so that each path component checks this short list
-    /// instead of scanning the central directory again; empty, and allocation-free, for
-    /// archives without symlinks.
+    /// Collected in one pass per resolution so that each path component is a map lookup
+    /// instead of another scan of the central directory; archives without symlinks allocate
+    /// nothing for it.
     #[cfg(feature = "full-symlinks")]
-    fn symlinks(&self) -> io::Result<Vec<(String, Entry<'a>)>> {
-        let mut symlinks: Vec<(String, Entry<'a>)> = Vec::new();
+    fn symlinks(&self) -> io::Result<std::collections::HashMap<String, Entry<'a>>> {
+        let mut symlinks = std::collections::HashMap::new();
         for entry in self.entries() {
             let entry = entry?;
-            let Some(name) = paths::normalize_entry_name(&entry.name()?).map(Cow::into_owned)
-            else {
+            let is_symlink = entry.kind() == EntryKind::Symlink;
+            // Only symlinks, and names that might shadow one, are looked at further, so
+            // archives without symlinks allocate nothing here.
+            if !is_symlink && symlinks.is_empty() {
+                continue;
+            }
+            let raw_name = entry.name()?;
+            let Some(name) = paths::normalize_entry_name(&raw_name) else {
                 continue;
             };
-            symlinks.retain(|(existing, _)| *existing != name);
-            if entry.kind() == EntryKind::Symlink && !name.is_empty() {
-                symlinks.push((name, entry));
+            if is_symlink && !name.is_empty() {
+                symlinks.insert(name.into_owned(), entry);
+            } else {
+                symlinks.remove(name.as_ref());
             }
         }
         Ok(symlinks)
@@ -373,10 +380,10 @@ impl<'a> ZipSlice<'a> {
     #[cfg(feature = "full-symlinks")]
     fn symlink_target_in(
         &self,
-        symlinks: &[(String, Entry<'a>)],
+        symlinks: &std::collections::HashMap<String, Entry<'a>>,
         normalized: &str,
     ) -> io::Result<Option<Vec<u8>>> {
-        let Some((_, entry)) = symlinks.iter().find(|(name, _)| name == normalized) else {
+        let Some(entry) = symlinks.get(normalized) else {
             return Ok(None);
         };
         let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];

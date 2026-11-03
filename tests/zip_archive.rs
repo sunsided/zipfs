@@ -1149,6 +1149,54 @@ fn path_resolution_work_is_bounded() {
     assert_eq!(slice.get(&path).unwrap(), b"x");
 }
 
+/// Collecting an archive's symlinks for a lookup is linear in the number of entries, also when
+/// most of them are symlinks.
+#[cfg(feature = "full-symlinks")]
+#[test]
+fn many_symlinks_resolve_quickly() {
+    let names: Vec<String> = (0..30_000).map(|i| format!("links/l{i}")).collect();
+    let mut entries: Vec<Hand<'_>> = names
+        .iter()
+        .map(|name| Hand::symlink(name.as_bytes(), b"../target.txt"))
+        .collect();
+    entries.push(Hand::file(b"target.txt", b"t"));
+    let bytes = build(&entries, b"");
+    let slice = ZipSlice::new(&bytes).unwrap();
+
+    let started = std::time::Instant::now();
+    assert_eq!(slice.get("links/l29999").unwrap(), b"t");
+    assert_eq!(slice.get("links/l0").unwrap(), b"t");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "two lookups took {:?}",
+        started.elapsed()
+    );
+}
+
+/// The last entry with a path decides whether it is a symlink, in both readers.
+#[cfg(feature = "full-symlinks")]
+#[test]
+fn later_entries_override_symlinks() {
+    let bytes = build(
+        &[
+            Hand::file(b"real/x.txt", b"via link"),
+            Hand::symlink(b"dir", b"real"),
+            Hand::file(b"dir", b"now a file"),
+            Hand::file(b"plain", b"was a file"),
+            Hand::symlink(b"plain", b"real/x.txt"),
+        ],
+        b"",
+    );
+    let slice = ZipSlice::new(&bytes).unwrap();
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(slice.get("dir").unwrap(), b"now a file");
+    assert_eq!(&*zip.read("dir").unwrap(), b"now a file");
+    assert!(slice.get("dir/x.txt").is_err());
+    assert!(zip.read("dir/x.txt").is_err());
+    assert_eq!(slice.get("plain").unwrap(), b"via link");
+    assert_eq!(&*zip.read("plain").unwrap(), b"via link");
+}
+
 #[cfg(not(feature = "full-symlinks"))]
 #[test]
 fn symlinks_are_followed_in_the_final_component_only() {
