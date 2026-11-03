@@ -810,6 +810,7 @@ fn zip_slice_follows_symlinks() {
             Hand::symlink(b"absolute", b"/etc/passwd"),
             Hand::symlink(b"dangling", b"missing.txt"),
             Hand::symlink(b"to_dir", b"dir"),
+            Hand::symlink(b"empty", b""),
         ],
         b"",
     );
@@ -840,6 +841,15 @@ fn zip_slice_follows_symlinks() {
         ErrorKind::InvalidInput
     );
     assert_eq!(zip.get("dangling").unwrap_err().kind(), ErrorKind::NotFound);
+    assert_eq!(zip.get("empty").unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        ZipArchive::new(&bytes[..])
+            .unwrap()
+            .read_link("empty")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
     assert_eq!(
         zip.get("to_dir").unwrap_err().kind(),
         ErrorKind::IsADirectory
