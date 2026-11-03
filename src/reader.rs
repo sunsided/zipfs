@@ -150,8 +150,12 @@ impl Read for EntryReader<'_> {
     }
 }
 
-/// Runs the raw-deflate state machine until it writes output, finishes, or stops making
-/// progress. Returns the number of bytes written; 0 means the stream ended.
+/// Runs the raw-deflate state machine until it writes output or reaches the end of the stream.
+///
+/// Returns the number of bytes written; 0 means the stream ended at its final block. Input that
+/// runs out before that is [`ErrorKind::UnexpectedEof`], and input the decoder cannot make
+/// progress on is [`ErrorKind::InvalidData`], so a truncated stream is never mistaken for a
+/// complete one even if it already produced the declared number of bytes.
 #[cfg(feature = "deflate")]
 fn inflate(
     state: &mut miniz_oxide::inflate::stream::InflateState,
@@ -167,9 +171,20 @@ fn inflate(
             return Ok(result.bytes_written);
         }
         match result.status {
-            Ok(MZStatus::StreamEnd) | Err(MZError::Buf) => return Ok(0),
-            Ok(_) if result.bytes_consumed == 0 => return Ok(0),
-            Ok(_) => {}
+            Ok(MZStatus::StreamEnd) => return Ok(0),
+            Ok(_) | Err(MZError::Buf) if result.bytes_consumed > 0 => {}
+            Ok(_) | Err(MZError::Buf) if input.is_empty() => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "deflate stream is truncated",
+                ));
+            }
+            Ok(_) | Err(MZError::Buf) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "deflate stream makes no progress",
+                ));
+            }
             Err(_) => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,

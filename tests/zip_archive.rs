@@ -600,6 +600,52 @@ fn unix_modes_from_windows_writers_are_used() {
     assert_eq!(zip.metadata("noise.txt").unwrap().kind, EntryKind::File);
 }
 
+/// Raw deflate data holding `payload` in one stored block; `last` sets the BFINAL bit.
+#[cfg(feature = "deflate")]
+fn deflate_stored_block(payload: &[u8], last: bool) -> Vec<u8> {
+    let len = payload.len() as u16;
+    let mut out = vec![u8::from(last)]; // BFINAL, BTYPE = 00 (stored), padded to a byte
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A deflate stream must reach its end marker; producing the declared bytes with the right
+/// CRC is not enough.
+#[cfg(feature = "deflate")]
+#[test]
+fn truncated_deflate_streams_are_rejected() {
+    let payload = b"complete output, missing final block";
+    let complete = deflate_stored_block(payload, true);
+    let truncated = deflate_stored_block(payload, false);
+    let entry = |name: &'static [u8], data: &'static [u8]| {
+        let mut entry = Hand::file(name, data);
+        entry.method = 8;
+        entry.crc = Some(crc32(payload));
+        entry.uncompressed_size = Some(payload.len() as u32);
+        entry
+    };
+    let complete: &'static [u8] = complete.leak();
+    let truncated: &'static [u8] = truncated.leak();
+    let bytes = build(
+        &[entry(b"complete", complete), entry(b"truncated", truncated)],
+        b"",
+    );
+
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    assert_eq!(&*zip.read("complete").unwrap(), payload);
+    let err = zip.read("truncated").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
+    let mut out = Vec::new();
+    let err = zip
+        .open("truncated")
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
+}
+
 #[test]
 fn encrypted_entries_are_rejected() {
     let mut entry = Hand::file(b"secret.txt", b"x");
