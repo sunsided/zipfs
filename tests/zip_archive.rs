@@ -1041,6 +1041,95 @@ fn zip_slice_follows_symlinks() {
     );
 }
 
+/// Links to directories, followed anywhere in a path (`full-symlinks`).
+fn directory_links() -> Vec<u8> {
+    build(
+        &[
+            Hand::file(b"real/dir/file.txt", b"payload"),
+            Hand::file(b"real/other.txt", b"other"),
+            Hand::symlink(b"dirlink", b"real/dir"),
+            Hand::symlink(b"a/nested", b"../dirlink"),
+            Hand::symlink(b"real/dir/up", b".."),
+            Hand::symlink(b"real/dir/inner", b"file.txt"),
+            Hand::symlink(b"loop", b"loop"),
+            Hand::symlink(b"escape", b"../.."),
+        ],
+        b"",
+    )
+}
+
+#[cfg(feature = "full-symlinks")]
+#[test]
+fn symlinks_are_followed_in_every_path_component() {
+    let bytes = directory_links();
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    let slice = ZipSlice::new(&bytes).unwrap();
+
+    for (path, expected) in [
+        ("dirlink/file.txt", &b"payload"[..]),
+        ("a/nested/file.txt", b"payload"),
+        ("dirlink/up/other.txt", b"other"),
+        ("dirlink/inner", b"payload"),
+        // `..` applies after following the link: dirlink is real/dir, so this is real/other.txt.
+        ("dirlink/../other.txt", b"other"),
+    ] {
+        assert_eq!(&*zip.read(path).unwrap(), expected, "ZipArchive: {path}");
+        assert_eq!(slice.get(path).unwrap(), expected, "ZipSlice: {path}");
+    }
+
+    assert_eq!(zip.canonicalize("a/nested/up").unwrap(), "real");
+    assert_eq!(zip.metadata("a/nested").unwrap().kind, EntryKind::Directory);
+    assert_eq!(
+        names(&zip.read_dir("dirlink").unwrap()),
+        ["file.txt", "inner", "up"]
+    );
+
+    // Operations on a link itself resolve the directories above it, not the link.
+    assert_eq!(
+        zip.symlink_metadata("dirlink/inner").unwrap().kind,
+        EntryKind::Symlink
+    );
+    assert_eq!(zip.read_link("dirlink/inner").unwrap(), "real/dir/file.txt");
+    assert_eq!(
+        slice.read_link("dirlink/inner").unwrap(),
+        "real/dir/file.txt"
+    );
+    assert_eq!(zip.read_link("a/nested").unwrap(), "dirlink");
+
+    assert_eq!(
+        zip.read("loop/file.txt").unwrap_err().to_string(),
+        "too many levels of symbolic links"
+    );
+    assert!(slice.get("loop/file.txt").is_err());
+    assert_eq!(
+        zip.read("escape/x").unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        slice.get("escape/x").unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        zip.read("../outside").unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+#[cfg(not(feature = "full-symlinks"))]
+#[test]
+fn symlinks_are_followed_in_the_final_component_only() {
+    let bytes = directory_links();
+    let zip = ZipArchive::new(&bytes[..]).unwrap();
+    for path in ["dirlink/inner", "dirlink/file.txt"] {
+        assert_eq!(
+            zip.read(path).unwrap_err().kind(),
+            ErrorKind::NotFound,
+            "{path}"
+        );
+    }
+    assert_eq!(&*zip.read("real/dir/inner").unwrap(), b"payload");
+}
+
 #[test]
 fn zip_slice_resolves_fixture_symlinks() {
     // The links are stored; their targets are deflated files, which ZipSlice cannot borrow.

@@ -33,6 +33,10 @@ zstd = ["dep:ruzstd"]
 # Compute CRC-32 checksums with the `crc32fast` crate (SIMD where available) instead of the
 # built-in slicing-by-16 implementation.
 crc32fast = ["dep:crc32fast"]
+# Follow symlinks in every path component (`linked_dir/file.png`), not only the last one. As on
+# a file system, `..` applies after following a link, and entries stored below a symlinked
+# directory are shadowed by the link.
+full-symlinks = []
 # `ZipFS`: a read-only lunchbox filesystem over an archive in memory.
 lunchbox = ["dep:lunchbox", "dep:async-trait", "dep:tokio"]
 # With `default-features = false`, only stored (uncompressed) entries are supported and

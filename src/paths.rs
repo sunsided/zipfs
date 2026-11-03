@@ -87,6 +87,21 @@ pub(crate) fn check_link_target_size(link_path: &str, size: u64) -> io::Result<(
 /// are not portable (NUL, drive letters) and targets that climb above the archive root with
 /// [`ErrorKind::InvalidInput`].
 pub(crate) fn resolve_link(link_path: &str, target: &[u8]) -> io::Result<String> {
+    let target = check_link_target(target)?;
+    let joined = format!("{}/{target}", parent(link_path));
+    normalize_entry_name(&joined)
+        .map(Cow::into_owned)
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "symlink target points outside the archive",
+            )
+        })
+}
+
+/// Validates a symlink target: UTF-8, not empty, relative and portable (no NUL, no drive
+/// letters).
+pub(crate) fn check_link_target(target: &[u8]) -> io::Result<&str> {
     let target = std::str::from_utf8(target)
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "symlink target is not UTF-8"))?;
     if target.is_empty() {
@@ -105,15 +120,68 @@ pub(crate) fn resolve_link(link_path: &str, target: &[u8]) -> io::Result<String>
             "symlink target is absolute or not a portable path",
         ));
     }
-    let joined = format!("{}/{target}", parent(link_path));
-    normalize_entry_name(&joined)
-        .map(Cow::into_owned)
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidInput,
-                "symlink target points outside the archive",
-            )
-        })
+    Ok(target)
+}
+
+/// Resolves `path` component by component, following a symlink wherever one occurs (the
+/// `full-symlinks` feature). The final component is followed only if `follow_final` is set.
+///
+/// A symlink is replaced by its target, read relative to the link's directory, and the walk
+/// continues with the target's components followed by the rest of the path. `..` is applied
+/// to the path resolved so far, so it climbs out of a symlink's target rather than out of the
+/// link's own directory, as in POSIX path resolution. `symlink_target` returns the raw target
+/// of the entry at a normalized path if that entry is a symlink.
+///
+/// `from_link` marks paths built from a symlink target, for which climbing above the archive
+/// root is an invalid link rather than a missing file.
+#[cfg(feature = "full-symlinks")]
+pub(crate) fn resolve_walk(
+    path: &str,
+    follow_final: bool,
+    from_link: bool,
+    mut symlink_target: impl FnMut(&str) -> io::Result<Option<Vec<u8>>>,
+) -> io::Result<String> {
+    let mut pending: Vec<String> = path.split('/').rev().map(str::to_string).collect();
+    let mut resolved: Vec<String> = Vec::new();
+    let mut hops = 0;
+    while let Some(component) = pending.pop() {
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(if hops == 0 && !from_link {
+                        io::Error::new(
+                            ErrorKind::NotFound,
+                            format!("file not found in zip archive: {path}"),
+                        )
+                    } else {
+                        io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "symlink target points outside the archive",
+                        )
+                    });
+                }
+                continue;
+            }
+            _ => {}
+        }
+        resolved.push(component);
+        let is_final = pending.iter().all(|rest| matches!(rest.as_str(), "" | "."));
+        if is_final && !follow_final {
+            break;
+        }
+        let Some(target) = symlink_target(&resolved.join("/"))? else {
+            continue;
+        };
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return Err(too_many_links());
+        }
+        let target = check_link_target(&target)?;
+        resolved.pop();
+        pending.extend(target.split(['/', '\\']).rev().map(str::to_string));
+    }
+    Ok(resolved.join("/"))
 }
 
 pub(crate) fn too_many_links() -> io::Error {

@@ -267,6 +267,15 @@ impl<'a> ZipSlice<'a> {
     /// `String`. Targets are limited to 4 KiB, may not be absolute or leave the archive root,
     /// and at most 40 links are followed.
     pub fn resolve<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
+        #[cfg(feature = "full-symlinks")]
+        return self.resolve_walk(path);
+        #[cfg(not(feature = "full-symlinks"))]
+        self.resolve_lexical(path)
+    }
+
+    /// Follows symlinks in the final path component, joining targets lexically.
+    #[cfg(not(feature = "full-symlinks"))]
+    fn resolve_lexical<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
         let mut current = normalize(path).ok_or_else(|| not_found(path))?;
         for _ in 0..paths::MAX_SYMLINK_HOPS {
             let entry = match self.find(&current)? {
@@ -289,8 +298,28 @@ impl<'a> ZipSlice<'a> {
         Err(paths::too_many_links())
     }
 
+    /// Follows symlinks in every path component (`full-symlinks`).
+    #[cfg(feature = "full-symlinks")]
+    fn resolve_walk<'p>(&self, path: &'p str) -> io::Result<(Cow<'p, str>, Entry<'a>)> {
+        let resolved = paths::resolve_walk(path, true, false, |p| self.symlink_target_bytes(p))?;
+        let entry = match self.find(&resolved)? {
+            Some(entry) => entry,
+            None if self.has_children(&resolved)? => {
+                return Err(io::Error::new(
+                    ErrorKind::IsADirectory,
+                    format!("is a directory: {resolved}"),
+                ));
+            }
+            None => return Err(not_found(&resolved)),
+        };
+        Ok((Cow::Owned(resolved), entry))
+    }
+
     /// Returns the target of the symlink at `path` as a normalized path from the archive root.
     pub fn read_link(&self, path: &str) -> io::Result<String> {
+        #[cfg(feature = "full-symlinks")]
+        let link_path = paths::resolve_walk(path, false, false, |p| self.symlink_target_bytes(p))?;
+        #[cfg(not(feature = "full-symlinks"))]
         let link_path = normalize(path).ok_or_else(|| not_found(path))?;
         let entry = self
             .find(&link_path)?
@@ -300,7 +329,28 @@ impl<'a> ZipSlice<'a> {
         }
         let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];
         let target = self.link_target(&link_path, &entry, &mut buffer)?;
+        #[cfg(feature = "full-symlinks")]
+        {
+            let target = paths::check_link_target(target)?.replace('\\', "/");
+            let joined = format!("{}/{target}", paths::parent(&link_path));
+            paths::resolve_walk(&joined, false, true, |p| self.symlink_target_bytes(p))
+        }
+        #[cfg(not(feature = "full-symlinks"))]
         paths::resolve_link(&link_path, target)
+    }
+
+    /// The raw target of the entry at a normalized path, if it is a symlink.
+    #[cfg(feature = "full-symlinks")]
+    fn symlink_target_bytes(&self, normalized: &str) -> io::Result<Option<Vec<u8>>> {
+        match self.find(normalized)? {
+            Some(entry) if entry.kind() == EntryKind::Symlink => {
+                let mut buffer = [0u8; paths::MAX_SYMLINK_TARGET];
+                Ok(Some(
+                    self.link_target(normalized, &entry, &mut buffer)?.to_vec(),
+                ))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Whether any entry lies below the normalized directory path `dir`, which makes `dir` a
