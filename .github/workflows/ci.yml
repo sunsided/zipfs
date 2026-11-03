@@ -30,11 +30,14 @@ jobs:
         name:
           - default features
           - no default features
+          - all features
         include:
           - name: default features
             cargo_args: ""
           - name: no default features
             cargo_args: --no-default-features
+          - name: all features
+            cargo_args: --all-features
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,6 +66,7 @@ jobs:
       - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   msrv:
     name: MSRV (1.87)
@@ -75,6 +79,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --verbose
       - run: cargo test --verbose --no-default-features
+      - run: cargo test --verbose --all-features
 
   build_wasm:
     name: WASM Build ${{ matrix.target }} (${{ matrix.name }})
@@ -89,11 +94,12 @@ jobs:
           - target: wasm32-unknown-unknown
             name: no default features
             cargo_args: --no-default-features
-          # zstd-sys compiles C code and needs a WASI sysroot (wasi-sdk) on wasm32-wasip1,
-          # so only the pure-Rust feature sets are built here.
+          - target: wasm32-unknown-unknown
+            name: all features
+            cargo_args: --all-features
           - target: wasm32-wasip1
-            name: deflate only
-            cargo_args: --no-default-features --features deflate
+            name: default features
+            cargo_args: ""
           - target: wasm32-wasip1
             name: no default features
             cargo_args: --no-default-features
